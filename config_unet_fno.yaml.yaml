@@ -1,0 +1,79 @@
+# U-Net-FNO Configuration for Navier-Stokes Velocity Prediction
+
+# Data parameters
+data:
+  data_dir: ../GAN/data_wss_dirty
+  validation_dir: ../GAN/validation_wss_dirty
+  max_train: 11050
+  max_val: 2781
+  batch_size: 16
+  num_workers: 4
+  pin_memory: true
+  shape: [64, 64]
+
+# Model parameters
+model:
+  # Architecture
+  in_channels: 2              # Pressure + Wall Shear Stress
+  out_channels: 2             # U-velocity + V-velocity
+  base_channels: 64           # Base number of channels
+  depth: 4                    # U-Net encoder-decoder depth
+  modes: 16                   # Fourier modes in FNO blocks
+  
+  # Physics constraints
+  enforce_incompressible: true # Apply divergence-free constraint
+  
+# Training parameters
+training:
+  epochs: 200
+  learning_rate: 0.0001
+  weight_decay: 0.0001
+  use_mixed_precision: false  # Set to true for faster training on RTX cards
+  gradient_clipping: 1.0
+  
+  # Physics loss weights
+  physics_weights:
+    mse: 1.0                  # Main reconstruction loss
+    divergence: 0.1           # Incompressibility (∇·u = 0)
+    boundary: 0.05            # Periodic boundary conditions
+    spectral: 0.1             # Energy spectrum preservation
+  
+  # Learning rate scheduling
+  scheduler_type: "CosineAnnealingLR"
+  T_max: 50                   # Cosine annealing period
+  eta_min: 0.000001          # Minimum learning rate
+  
+  # Validation and saving
+  validation_interval: 5
+  save_interval: 20
+  visualization_interval: 10
+
+# Output parameters
+output:
+  output_dir: ./results_unet_fno
+  save_best_model: true
+  save_visualizations: true
+  
+# Hardware optimization
+hardware:
+  use_gpu: true
+  num_workers: 4
+  pin_memory: true
+
+# Reproducibility
+reproducibility:
+  seed: 42
+  deterministic: true
+
+# Monitoring
+monitoring:
+  tensorboard: true
+  log_level: "INFO"
+  track_metrics:
+    - "train_loss"
+    - "val_loss"
+    - "mse_loss"
+    - "divergence_loss"
+    - "boundary_loss"
+    - "spectral_loss"
+    - "learning_rate"

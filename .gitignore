@@ -1,0 +1,38 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pyw
+*.pyz
+*.log
+*.out
+*.err
+
+# project specific directories
+data/
+data_*/
+images/
+logs/
+logs_*/
+results/
+results_*/
+validation/
+validation_*/
+visualization_*/
+plots/
+*plots*/
+.old/
+
+#other branches
+GAN_v01/
+
+# specific files
+ACKNOWLEDGEMENTS
+CONTRIBUTORS
+LICENSE
+test
+
+stats*txt
+stats*csv
+R-*
+E-*
