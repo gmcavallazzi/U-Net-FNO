@@ -12,6 +12,7 @@ import logging
 import argparse
 import torch
 import numpy as np
+import yaml
 from datetime import datetime
 
 # Import existing data utilities
@@ -20,7 +21,7 @@ from data_loader import (
     create_dataloaders_quadruplets, 
     load_validation_data_numpy_quadruplets
 )
-from utils import setup_random_seeds, setup_logging
+from utils import setup_random_seeds, setup_logging, load_config
 
 # Import new U-Net-FNO components
 from unet_fno_model import UNetFNO
@@ -29,49 +30,46 @@ from train_unet_fno import UNetFNOTrainer
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Train U-Net-FNO for velocity prediction')
-    parser.add_argument('--data_dir', type=str, default='./data_wss_uv',
-                       help='Training data directory')
-    parser.add_argument('--val_dir', type=str, default='./validation_wss_uv',
-                       help='Validation data directory')
-    parser.add_argument('--epochs', type=int, default=200,
-                       help='Number of training epochs')
-    parser.add_argument('--batch_size', type=int, default=16,
-                       help='Training batch size')
-    parser.add_argument('--lr', type=float, default=1e-4,
-                       help='Learning rate')
-    parser.add_argument('--max_train', type=int, default=6080,
-                       help='Maximum training samples')
-    parser.add_argument('--max_val', type=int, default=1520,
-                       help='Maximum validation samples')
-    parser.add_argument('--modes', type=int, default=16,
-                       help='Number of Fourier modes in FNO')
-    parser.add_argument('--channels', type=int, default=64,
-                       help='Base number of channels')
-    parser.add_argument('--depth', type=int, default=4,
-                       help='U-Net depth')
-    parser.add_argument('--output_dir', type=str, default='./results_unet_fno',
-                       help='Output directory')
+    parser.add_argument('--config', type=str, default='config_unet_fno.yaml',
+                       help='Path to YAML config file')
     parser.add_argument('--resume', type=str, default=None,
                        help='Resume from checkpoint (path to .pt file)')
-    parser.add_argument('--no_gpu', action='store_true',
-                       help='Disable GPU usage')
-    parser.add_argument('--mixed_precision', action='store_true',
-                       help='Use mixed precision training')
-    parser.add_argument('--incompressible', action='store_true', default=True,
-                       help='Enforce incompressible flow constraint')
-    
-    # Checkpointing and logging options
-    parser.add_argument('--save_interval', type=int, default=20,
-                       help='Save checkpoint every N epochs')
-    parser.add_argument('--val_interval', type=int, default=5,
-                       help='Run validation every N epochs')
-    parser.add_argument('--log_level', type=str, default='INFO',
-                       choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
-                       help='Logging level')
     parser.add_argument('--experiment_name', type=str, default=None,
                        help='Experiment name for output directory')
     
+    # Allow command line overrides of config file
+    parser.add_argument('--data_dir', type=str, default=None,
+                       help='Training data directory (overrides config)')
+    parser.add_argument('--epochs', type=int, default=None,
+                       help='Number of training epochs (overrides config)')
+    parser.add_argument('--batch_size', type=int, default=None,
+                       help='Training batch size (overrides config)')
+    parser.add_argument('--lr', type=float, default=None,
+                       help='Learning rate (overrides config)')
+    parser.add_argument('--no_gpu', action='store_true',
+                       help='Disable GPU usage')
+    parser.add_argument('--mixed_precision', action='store_true',
+                       help='Use mixed precision training (overrides config)')
+    
     return parser.parse_args()
+
+def merge_config_args(config, args):
+    """Merge command line arguments with config file, with args taking priority"""
+    # Command line arguments override config file
+    if args.data_dir is not None:
+        config['data']['data_dir'] = args.data_dir
+    if args.epochs is not None:
+        config['training']['epochs'] = args.epochs
+    if args.batch_size is not None:
+        config['data']['batch_size'] = args.batch_size
+    if args.lr is not None:
+        config['training']['learning_rate'] = args.lr
+    if args.mixed_precision:
+        config['training']['use_mixed_precision'] = True
+    if args.no_gpu:
+        config['hardware']['use_gpu'] = False
+    
+    return config
 
 
 def setup_directories(output_dir, experiment_name=None):
@@ -96,13 +94,23 @@ def setup_directories(output_dir, experiment_name=None):
 def main():
     args = parse_args()
     
+    # Load configuration file
+    if not os.path.exists(args.config):
+        logging.error(f"Config file not found: {args.config}")
+        return 1
+    
+    config = load_config(args.config)
+    
+    # Merge command line arguments with config (args take priority)
+    config = merge_config_args(config, args)
+    
     # Setup logging level
-    log_level = getattr(logging, args.log_level.upper(), logging.INFO)
+    log_level = getattr(logging, config.get('monitoring', {}).get('log_level', 'INFO').upper(), logging.INFO)
     setup_logging(console_only=True, level=log_level)
-    setup_random_seeds(42)
+    setup_random_seeds(config.get('reproducibility', {}).get('seed', 42))
     
     # Device setup
-    device = 'cuda' if torch.cuda.is_available() and not args.no_gpu else 'cpu'
+    device = 'cuda' if torch.cuda.is_available() and config.get('hardware', {}).get('use_gpu', True) else 'cpu'
     logging.info(f"Using device: {device}")
     
     if device == 'cuda':
@@ -110,23 +118,26 @@ def main():
         logging.info(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
     
     # Create output directories
-    run_dir, models_dir, logs_dir = setup_directories(args.output_dir, args.experiment_name)
+    output_dir = config.get('output', {}).get('output_dir', './results_unet_fno')
+    run_dir, models_dir, logs_dir = setup_directories(output_dir, args.experiment_name)
     logging.info(f"Output directory: {run_dir}")
     
     # Save configuration for reproducibility
-    import json
-    config_dict = vars(args)
-    with open(os.path.join(run_dir, 'config.json'), 'w') as f:
-        json.dump(config_dict, f, indent=2)
-    logging.info("Configuration saved to config.json")
+    config_save_path = os.path.join(run_dir, 'config_used.yaml')
+    with open(config_save_path, 'w') as f:
+        import yaml
+        yaml.dump(config, f, default_flow_style=False)
+    logging.info(f"Configuration saved to: {config_save_path}")
     
-    # Load data
+    # Load data using config parameters
+    data_config = config['data']
     logging.info("Loading training and validation data...")
     train_quadruplets, val_quadruplets = find_matching_quadruplets(
-        args.data_dir, args.val_dir,
+        data_config['data_dir'], 
+        data_config['validation_dir'],
         shuffle=True,
-        max_train=args.max_train,
-        max_val=args.max_val
+        max_train=data_config.get('max_train', None),
+        max_val=data_config.get('max_val', None)
     )
     
     if not train_quadruplets:
@@ -139,10 +150,10 @@ def main():
     # Create data loaders
     train_loader, val_loader = create_dataloaders_quadruplets(
         train_quadruplets,
-        batch_size=args.batch_size,
-        shape=(64, 64),
-        num_workers=4,
-        pin_memory=(device == 'cuda'),
+        batch_size=data_config['batch_size'],
+        shape=tuple(data_config.get('shape', [64, 64])),
+        num_workers=data_config.get('num_workers', 4),
+        pin_memory=(device == 'cuda' and data_config.get('pin_memory', True)),
         val_quadruplets=val_quadruplets
     )
     
@@ -151,40 +162,42 @@ def main():
     if val_quadruplets:
         val_input, val_velocity = load_validation_data_numpy_quadruplets(
             val_quadruplets,
-            max_samples=min(200, len(val_quadruplets)),  # Limit for efficiency
-            shape=(64, 64)
+            max_samples=min(200, len(val_quadruplets)),
+            shape=tuple(data_config.get('shape', [64, 64]))
         )
         if val_input is not None:
             val_data = (val_input, val_velocity)
             logging.info(f"Loaded validation data: {val_input.shape}")
     
-    # Create model
+    # Create model using config parameters
+    model_config = config['model']
     model = UNetFNO(
-        in_channels=2,  # Pressure + WSS
-        out_channels=2,  # U + V velocity
-        base_channels=args.channels,
-        depth=args.depth,
-        modes=args.modes,
-        enforce_incompressible=args.incompressible
+        in_channels=model_config.get('in_channels', 2),
+        out_channels=model_config.get('out_channels', 2),
+        base_channels=model_config.get('base_channels', 64),
+        depth=model_config.get('depth', 4),
+        modes=model_config.get('modes', 16),
+        enforce_incompressible=model_config.get('enforce_incompressible', True)
     )
     
     logging.info(f"Model created with {sum(p.numel() for p in model.parameters() if p.requires_grad):,} parameters")
     
-    # Physics loss weights for Navier-Stokes
-    physics_weights = {
-        'mse': 1.0,           # Main reconstruction loss
-        'divergence': 0.1,    # Incompressibility constraint
-        'boundary': 0.05,     # Periodic boundary conditions
-        'spectral': 0.1       # Energy spectrum preservation
-    }
+    # Physics loss weights from config
+    training_config = config['training']
+    physics_weights = training_config.get('physics_weights', {
+        'mse': 1.0,
+        'divergence': 0.1,
+        'boundary': 0.05,
+        'spectral': 0.1
+    })
     
     # Create trainer
     trainer = UNetFNOTrainer(
         model=model,
         device=device,
-        learning_rate=args.lr,
+        learning_rate=training_config.get('learning_rate', 1e-4),
         physics_weights=physics_weights,
-        use_mixed_precision=args.mixed_precision
+        use_mixed_precision=training_config.get('use_mixed_precision', False)
     )
     
     # Resume from checkpoint if provided
@@ -197,21 +210,25 @@ def main():
         logging.warning(f"Resume checkpoint not found: {args.resume}")
         logging.info("Starting training from scratch...")
     
-    # Training configuration
+    # Training configuration summary
+    epochs = training_config.get('epochs', 200)
+    save_interval = training_config.get('save_interval', 20)
+    val_interval = training_config.get('validation_interval', 5)
+    
     logging.info("\n" + "="*60)
     logging.info("TRAINING CONFIGURATION")
     logging.info("="*60)
-    logging.info(f"  Epochs: {args.epochs} (starting from {start_epoch})")
-    logging.info(f"  Batch size: {args.batch_size}")
-    logging.info(f"  Learning rate: {args.lr}")
+    logging.info(f"  Epochs: {epochs} (starting from {start_epoch})")
+    logging.info(f"  Batch size: {data_config['batch_size']}")
+    logging.info(f"  Learning rate: {training_config['learning_rate']}")
     logging.info(f"  Device: {device}")
-    logging.info(f"  Mixed precision: {args.mixed_precision}")
+    logging.info(f"  Mixed precision: {training_config.get('use_mixed_precision', False)}")
     logging.info(f"  Model parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
     logging.info("\nModel Architecture:")
-    logging.info(f"  Fourier modes: {args.modes}")
-    logging.info(f"  Base channels: {args.channels}")
-    logging.info(f"  U-Net depth: {args.depth}")
-    logging.info(f"  Incompressible flow: {args.incompressible}")
+    logging.info(f"  Fourier modes: {model_config.get('modes', 16)}")
+    logging.info(f"  Base channels: {model_config.get('base_channels', 64)}")
+    logging.info(f"  U-Net depth: {model_config.get('depth', 4)}")
+    logging.info(f"  Incompressible flow: {model_config.get('enforce_incompressible', True)}")
     logging.info("\nPhysics Loss Weights:")
     for key, value in physics_weights.items():
         logging.info(f"  {key}: {value}")
@@ -227,11 +244,11 @@ def main():
         history = trainer.train(
             train_loader=train_loader,
             val_data=val_data,
-            epochs=args.epochs,
+            epochs=epochs,
             save_dir=models_dir,
             log_dir=logs_dir,
-            save_interval=args.save_interval,
-            validation_interval=args.val_interval
+            save_interval=save_interval,
+            validation_interval=val_interval
         )
         
         # Create final checkpoint summary
@@ -245,7 +262,7 @@ def main():
         if history['val_loss']:
             final_val_loss = history['val_loss'][-1]
             best_val_loss = min(history['val_loss'])
-            best_epoch = history['val_loss'].index(best_val_loss) * args.val_interval + 1
+            best_epoch = history['val_loss'].index(best_val_loss) * val_interval + 1
             logging.info(f"Final validation loss: {final_val_loss:.6f}")
             logging.info(f"Best validation loss: {best_val_loss:.6f} (epoch {best_epoch})")
         
@@ -261,7 +278,7 @@ def main():
         logging.info("\nAvailable model checkpoints:")
         logging.info("  - best_model.pt (best validation loss)")
         logging.info("  - final_model.pt (final epoch)")
-        logging.info(f"  - checkpoint_epoch_*.pt (every {args.save_interval} epochs)")
+        logging.info(f"  - checkpoint_epoch_*.pt (every {save_interval} epochs)")
         logging.info("  - initial_checkpoint.pt (starting point)")
         
         return 0

@@ -1,6 +1,6 @@
 #!/bin/bash
-#SBATCH -D /users/addh496/sharedscratch/GAN/
-#SBATCH -J gan_unet
+#SBATCH -D /users/addh496/sharedscratch/U-Net_FNO
+#SBATCH -J unet-FNO
 #SBATCH --partition=preemptgpu
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
@@ -8,15 +8,10 @@
 #SBATCH --mem=192G
 #SBATCH --time=24:00:00
 #SBATCH --output=R-%x.%j.out
-##SBATCH --gres=gpu:a100_80g:1
-# Uncomment the appropriate GPU line based on your needs:
 #SBATCH --gres=gpu:1
-##SBATCH --gres=gpu:rtx8000:1
-##SBATCH --gres=gpu:a100_80g:1
 
 # Get the git branch from command-line argument or use spectral-norm as default
-#GIT_BRANCH=${1:-spectral-norm}
-GIT_BRANCH=${1:-U-Net}
+GIT_BRANCH=${1:-master}
 echo "Target git branch: $GIT_BRANCH"
 
 # Load environment setup
@@ -86,4 +81,5 @@ python -c "import torch; print('PyTorch version:', torch.__version__); print('CU
 
 # Run your main script
 echo "Running main script..."
-python main.py --config unet_config.yaml
+python main_unet_fno.py
+#python main_unet_fno.py --resume ./results/run_*/models/best_model.pt
