@@ -212,7 +212,7 @@ class UNetFNOTrainer:
     
     def train(self, train_loader, val_data=None, epochs=100, save_dir='./models', 
               log_dir='./logs', save_interval=10, validation_interval=5):
-        """Main training loop with comprehensive logging and checkpointing"""
+        """Main training loop"""
         
         os.makedirs(save_dir, exist_ok=True)
         os.makedirs(log_dir, exist_ok=True)
@@ -220,48 +220,16 @@ class UNetFNOTrainer:
         # TensorBoard writer
         writer = SummaryWriter(log_dir)
         
-        # Log model architecture
-        if val_data is not None:
-            val_input, _ = val_data
-            sample_input = torch.tensor(val_input[:1], dtype=torch.float32).to(self.device)
-            writer.add_graph(self.model, sample_input)
-        
-        # Log hyperparameters
-        hparams = {
-            'learning_rate': self.optimizer.param_groups[0]['lr'],
-            'batch_size': train_loader.batch_size,
-            'model_params': count_parameters(self.model),
-            'physics_weights_mse': self.physics_weights.get('mse', 0),
-            'physics_weights_divergence': self.physics_weights.get('divergence', 0),
-            'physics_weights_boundary': self.physics_weights.get('boundary', 0),
-            'physics_weights_spectral': self.physics_weights.get('spectral', 0),
-        }
-        writer.add_hparams(hparams, {'hparam/placeholder': 0})
-        
         best_val_loss = float('inf')
-        best_epoch = 0
         
         logging.info(f"Starting training for {epochs} epochs")
         logging.info(f"Model parameters: {count_parameters(self.model):,}")
-        logging.info(f"Saving to: {save_dir}")
-        logging.info(f"Logging to: {log_dir}")
-        
-        # Save initial checkpoint
-        self.save_model(os.path.join(save_dir, 'initial_checkpoint.pt'), -1)
         
         for epoch in range(epochs):
             start_time = time.time()
             
             # Training
             train_losses = self.train_epoch(train_loader, epoch)
-            
-            # Compute gradient norm for monitoring
-            total_norm = 0
-            for p in self.model.parameters():
-                if p.grad is not None:
-                    param_norm = p.grad.norm()
-                    total_norm += param_norm.item() ** 2
-            total_norm = total_norm ** 0.5
             
             # Update history
             self.history['train_loss'].append(train_losses['total'])
@@ -281,74 +249,40 @@ class UNetFNOTrainer:
                 if val_losses:
                     self.history['val_loss'].append(val_losses['total'])
                     
-                    # Save best model with detailed info
+                    # Save best model
                     if val_losses['total'] < best_val_loss:
                         best_val_loss = val_losses['total']
-                        best_epoch = epoch
-                        self.save_model(os.path.join(save_dir, 'best_model.pt'), epoch, 
-                                      val_loss=best_val_loss, is_best=True)
-                        logging.info(f"New best model saved! Val Loss: {best_val_loss:.6f}")
+                        self.save_model(os.path.join(save_dir, 'best_model.pt'), epoch)
             
-            # Comprehensive TensorBoard logging
-            writer.add_scalar('Loss/Train_Total', train_losses['total'], epoch)
-            writer.add_scalar('Loss/Train_MSE', train_losses.get('mse', 0), epoch)
-            writer.add_scalar('Loss/Train_Divergence', train_losses.get('divergence', 0), epoch)
-            writer.add_scalar('Loss/Train_Boundary', train_losses.get('boundary', 0), epoch)
-            writer.add_scalar('Loss/Train_Spectral', train_losses.get('spectral', 0), epoch)
+            # TensorBoard logging
+            writer.add_scalar('Loss/Train', train_losses['total'], epoch)
+            writer.add_scalar('Learning_Rate', current_lr, epoch)
             
-            writer.add_scalar('Training/Learning_Rate', current_lr, epoch)
-            writer.add_scalar('Training/Gradient_Norm', total_norm, epoch)
-            
-            # Individual physics loss components
             for key, value in train_losses.items():
                 if key != 'total':
-                    writer.add_scalar(f'Physics_Detailed/{key.title()}', value, epoch)
+                    writer.add_scalar(f'Physics/{key}', value, epoch)
             
             if val_losses:
-                writer.add_scalar('Loss/Validation_Total', val_losses['total'], epoch)
-                for key, value in val_losses.items():
-                    if key != 'total':
-                        writer.add_scalar(f'Validation/{key.title()}', value, epoch)
+                writer.add_scalar('Loss/Validation', val_losses['total'], epoch)
             
-            # Log visualizations to TensorBoard
-            if val_data is not None and (epoch + 1) % validation_interval == 0:
-                fig = self.create_visualizations(val_data, epoch)
-                if fig is not None:
-                    writer.add_figure('Predictions', fig, epoch)
+            # Visualizations
+            if (epoch + 1) % validation_interval == 0:
+                self.create_visualizations(val_data, epoch)
             
-            # Save regular checkpoint with full state
+            # Save checkpoint
             if (epoch + 1) % save_interval == 0:
-                checkpoint_path = os.path.join(save_dir, f'checkpoint_epoch_{epoch+1}.pt')
-                self.save_model(checkpoint_path, epoch, train_loss=train_losses['total'], 
-                              val_loss=val_losses['total'] if val_losses else None)
+                self.save_model(os.path.join(save_dir, f'checkpoint_epoch_{epoch+1}.pt'), epoch)
             
-            # Logging with more details
+            # Logging
             epoch_time = time.time() - start_time
             val_msg = f", Val Loss: {val_losses['total']:.6f}" if val_losses else ""
-            physics_msg = f", Div: {train_losses.get('divergence', 0):.4f}, Bound: {train_losses.get('boundary', 0):.4f}"
             
-            logging.info(f"Epoch {epoch+1:3d}/{epochs} - "
-                        f"Train Loss: {train_losses['total']:.6f}{physics_msg}{val_msg} - "
-                        f"GradNorm: {total_norm:.4f}, Time: {epoch_time:.1f}s, LR: {current_lr:.2e}")
-            
-            # Save training progress plot every 20 epochs
-            if (epoch + 1) % 20 == 0:
-                self.save_training_plots(save_dir, epoch)
-        
-        # Final save
-        self.save_model(os.path.join(save_dir, 'final_model.pt'), epochs-1, 
-                       train_loss=train_losses['total'], 
-                       val_loss=val_losses['total'] if val_losses else None)
-        
-        # Log training summary
-        writer.add_text('Training_Summary', 
-                       f'Best validation loss: {best_val_loss:.6f} at epoch {best_epoch+1}\n'
-                       f'Final training loss: {train_losses["total"]:.6f}\n'
-                       f'Total epochs: {epochs}')
+            logging.info(f"Epoch {epoch+1}/{epochs} - "
+                        f"Train Loss: {train_losses['total']:.6f}{val_msg} - "
+                        f"Time: {epoch_time:.2f}s, LR: {current_lr:.2e}")
         
         writer.close()
-        logging.info(f"Training completed!")
-        logging.info(f"Best validation loss: {best_val_loss:.6f} at epoch {best_epoch+1}")
+        logging.info("Training completed!")
         
         return self.history
     

@@ -112,9 +112,11 @@ class UpBlock(nn.Module):
     def forward(self, x, skip):
         x = self.upsample(x)
         
-        # Handle size mismatch
-        if x.shape[-2:] != skip.shape[-2:]:
-            x = F.interpolate(x, size=skip.shape[-2:], mode='bilinear', align_corners=False)
+        # Handle size mismatch without tensor-to-boolean conversion
+        x_h, x_w = x.shape[-2:]
+        skip_h, skip_w = skip.shape[-2:]
+        if x_h != skip_h or x_w != skip_w:
+            x = F.interpolate(x, size=(skip_h, skip_w), mode='bilinear', align_corners=False)
         
         x = torch.cat([x, skip], dim=1)
         x = F.gelu(self.norm(self.conv(x)))

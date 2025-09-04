@@ -46,7 +46,7 @@ training:
   # Validation and saving
   validation_interval: 5
   save_interval: 20
-  visualization_interval: 10
+  visualization_interval: 5
 
 # Output parameters
 output:

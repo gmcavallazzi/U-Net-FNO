@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH -D /users/addh496/sharedscratch/U-Net_FNO
+#SBATCH -D /users/addh496/sharedscratch/U-Net-FNO
 #SBATCH -J unet-FNO
 #SBATCH --partition=preemptgpu
 #SBATCH --nodes=1
@@ -81,5 +81,6 @@ python -c "import torch; print('PyTorch version:', torch.__version__); print('CU
 
 # Run your main script
 echo "Running main script..."
+#python test_model.py
 python main_unet_fno.py
 #python main_unet_fno.py --resume ./results/run_*/models/best_model.pt
