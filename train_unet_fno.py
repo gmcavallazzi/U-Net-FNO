@@ -219,11 +219,32 @@ class UNetFNOTrainer:
         
         # TensorBoard writer
         writer = SummaryWriter(log_dir)
+        logging.info(f"TensorBoard logging enabled. View with: tensorboard --logdir={log_dir}")
         
         best_val_loss = float('inf')
         
         logging.info(f"Starting training for {epochs} epochs")
         logging.info(f"Model parameters: {count_parameters(self.model):,}")
+        
+        # Log model architecture to TensorBoard
+        writer.add_text('Model/Architecture', f"""
+        U-Net-FNO Model Configuration:
+        - Input channels: {getattr(self.model, 'in_channels', 2)}
+        - Output channels: {getattr(self.model, 'out_channels', 2)}  
+        - Base channels: {getattr(self.model, 'base_channels', 64)}
+        - Depth: {getattr(self.model, 'depth', 4)}
+        - FNO modes: {getattr(self.model, 'modes', 16)}
+        - Incompressible flow: {getattr(self.model, 'enforce_incompressible', True)}
+        - Total parameters: {count_parameters(self.model):,}
+        """, 0)
+        
+        # Log physics weights
+        physics_text = "Physics Loss Weights:\n"
+        for key, value in self.physics_weights.items():
+            physics_text += f"- {key}: {value}\n"
+        writer.add_text('Training/Physics_Weights', physics_text, 0)
+        
+        writer.flush()
         
         for epoch in range(epochs):
             start_time = time.time()
@@ -258,12 +279,29 @@ class UNetFNOTrainer:
             writer.add_scalar('Loss/Train', train_losses['total'], epoch)
             writer.add_scalar('Learning_Rate', current_lr, epoch)
             
+            # Log individual physics losses
             for key, value in train_losses.items():
                 if key != 'total':
-                    writer.add_scalar(f'Physics/{key}', value, epoch)
+                    writer.add_scalar(f'Train_Physics/{key}', value, epoch)
             
             if val_losses:
                 writer.add_scalar('Loss/Validation', val_losses['total'], epoch)
+                # Log validation physics losses too
+                for key, value in val_losses.items():
+                    if key != 'total':
+                        writer.add_scalar(f'Val_Physics/{key}', value, epoch)
+            
+            # Log gradient norms for monitoring
+            total_norm = 0
+            for p in self.model.parameters():
+                if p.grad is not None:
+                    param_norm = p.grad.data.norm(2)
+                    total_norm += param_norm.item() ** 2
+            total_norm = total_norm ** (1. / 2)
+            writer.add_scalar('Gradients/Total_Norm', total_norm, epoch)
+            
+            # Flush TensorBoard data every epoch
+            writer.flush()
             
             # Visualizations
             if (epoch + 1) % validation_interval == 0:
