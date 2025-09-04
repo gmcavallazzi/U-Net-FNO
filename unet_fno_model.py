@@ -101,24 +101,31 @@ class DownBlock(nn.Module):
 class UpBlock(nn.Module):
     """Upsampling block with FNO and skip connections"""
     
-    def __init__(self, in_channels, out_channels, modes=8):
+    def __init__(self, in_channels, out_channels, skip_channels, modes=8):
         super().__init__()
-        self.upsample = nn.ConvTranspose2d(in_channels, in_channels, 2, stride=2)
-        self.conv = nn.Conv2d(in_channels + out_channels, out_channels, 3, padding=1)
+        # Upsample and reduce channels to out_channels 
+        self.upsample = nn.ConvTranspose2d(in_channels, out_channels, 2, stride=2)
+        # After concatenation with skip, total channels = out_channels + skip_channels
+        concat_channels = out_channels + skip_channels if skip_channels > 0 else out_channels
+        # Process concatenated features
+        self.conv = nn.Conv2d(concat_channels, out_channels, 3, padding=1)
         self.fno = FNOBlock(out_channels, modes, modes)
         self.residual = ResidualBlock(out_channels)
         self.norm = nn.GroupNorm(min(8, out_channels), out_channels)
+        self.skip_channels = skip_channels
         
     def forward(self, x, skip):
         x = self.upsample(x)
         
-        # Handle size mismatch without tensor-to-boolean conversion
-        x_h, x_w = x.shape[-2:]
-        skip_h, skip_w = skip.shape[-2:]
-        if x_h != skip_h or x_w != skip_w:
-            x = F.interpolate(x, size=(skip_h, skip_w), mode='bilinear', align_corners=False)
+        if self.skip_channels > 0 and skip is not None:
+            # Handle size mismatch without tensor-to-boolean conversion
+            x_h, x_w = x.shape[-2:]
+            skip_h, skip_w = skip.shape[-2:]
+            if x_h != skip_h or x_w != skip_w:
+                x = F.interpolate(x, size=(skip_h, skip_w), mode='bilinear', align_corners=False)
+            
+            x = torch.cat([x, skip], dim=1)
         
-        x = torch.cat([x, skip], dim=1)
         x = F.gelu(self.norm(self.conv(x)))
         x = self.fno(x)
         x = self.residual(x)
@@ -142,12 +149,15 @@ class UNetFNO(nn.Module):
             nn.GELU()
         )
         
-        # Encoder
+        # Encoder - track channel progression
         self.down_blocks = nn.ModuleList()
+        self.skip_channels = []  # Track skip connection channel counts
         channels = base_channels
         for i in range(depth):
             out_ch = min(512, channels * 2) if i < depth - 1 else channels
             self.down_blocks.append(DownBlock(channels, out_ch, modes))
+            # All down blocks produce skip connections (used in reverse order in decoder)
+            self.skip_channels.append(out_ch)
             channels = out_ch
         
         # Bottleneck with enhanced FNO processing
@@ -157,17 +167,24 @@ class UNetFNO(nn.Module):
             FNOBlock(channels, modes, modes)
         )
         
-        # Decoder
+        # Decoder - use skip connection channels in reverse order
         self.up_blocks = nn.ModuleList()
+        current_channels = channels
+        # Skip connections: all encoder outputs in reverse order
+        skip_channels_for_decoder = self.skip_channels[::-1]  # Reverse order
+        
         for i in range(depth):
+            # Output channels: progressively reduce back to base_channels
             if i == depth - 1:
-                in_ch = channels
                 out_ch = base_channels
             else:
-                in_ch = channels
-                out_ch = channels // 2
-            self.up_blocks.append(UpBlock(in_ch, out_ch, modes))
-            channels = out_ch
+                out_ch = max(base_channels, current_channels // 2)
+            
+            # Skip channels: from encoder outputs in reverse order
+            skip_ch = skip_channels_for_decoder[i] if i < len(skip_channels_for_decoder) else 0
+            
+            self.up_blocks.append(UpBlock(current_channels, out_ch, skip_ch, modes))
+            current_channels = out_ch
         
         # Output head
         self.output_conv = nn.Sequential(
@@ -211,7 +228,7 @@ class UNetFNO(nn.Module):
         
         # Decoder
         for i, up_block in enumerate(self.up_blocks):
-            skip = skip_connections[-(i+1)]
+            skip = skip_connections[-(i+1)] if i < len(skip_connections) else None
             x = up_block(x, skip)
         
         # Output
