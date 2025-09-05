@@ -5,10 +5,10 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=192G
+#SBATCH --mem=96G
 #SBATCH --time=24:00:00
 #SBATCH --output=R-%x.%j.out
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:2
 
 # Get the git branch from command-line argument or use spectral-norm as default
 GIT_BRANCH=${1:-master}

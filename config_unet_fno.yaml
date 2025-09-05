@@ -44,9 +44,9 @@ training:
   eta_min: 0.000001          # Minimum learning rate
   
   # Validation and saving
-  validation_interval: 5
-  save_interval: 20
-  visualization_interval: 5
+  validation_interval: 2
+  save_interval: 10
+  visualization_interval: 2
 
 # Output parameters
 output:

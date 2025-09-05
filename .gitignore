@@ -36,3 +36,6 @@ stats*txt
 stats*csv
 R-*
 E-*
+
+*.jpg
+*.png
