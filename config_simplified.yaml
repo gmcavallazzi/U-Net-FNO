@@ -1,0 +1,74 @@
+# Simplified U-Net-FNO Configuration for Fixed Training
+
+# Data parameters
+data:
+  data_dir: ../GAN/data_wss_dirty
+  validation_dir: ../GAN/validation_wss_dirty
+  max_train: 11050
+  max_val: 2781
+  batch_size: 32  # Increased batch size for stability
+  num_workers: 4
+  pin_memory: true
+  shape: [64, 64]
+
+# Model parameters
+model:
+  in_channels: 2
+  out_channels: 2
+  base_channels: 64
+  depth: 3                    # Reduced from 4 to 3
+  modes: 12                   # Reduced from 16 to 12
+  enforce_incompressible: true # Keep this for physics
+  
+# Training parameters
+training:
+  epochs: 150
+  learning_rate: 0.0002       # Slightly higher learning rate
+  weight_decay: 0.00001       # Reduced weight decay
+  use_mixed_precision: false
+  gradient_clipping: 0.5      # Reduced gradient clipping
+  
+  # Simplified physics weights - REMOVED SPECTRAL LOSS
+  physics_weights:
+    mse: 1.0                  # Main reconstruction loss
+    divergence: 0.01          # Much smaller divergence weight
+    boundary: 0.001           # Much smaller boundary weight
+  
+  # Learning rate scheduling
+  scheduler_type: "CosineAnnealingLR"
+  T_max: 75                   # Reduced period
+  eta_min: 0.00001           # Higher minimum learning rate
+  
+  # Validation and saving
+  validation_interval: 5
+  save_interval: 15
+  visualization_interval: 5   # Not used anymore (only TensorBoard)
+
+# Output parameters
+output:
+  output_dir: ./results_unet_fno  # Fixed name to match main script
+  save_best_model: true
+  save_visualizations: true       # Only applies to TensorBoard now
+  
+# Hardware optimization
+hardware:
+  use_gpu: true
+  num_workers: 4
+  pin_memory: true
+
+# Reproducibility
+reproducibility:
+  seed: 42
+  deterministic: true
+
+# Monitoring
+monitoring:
+  tensorboard: true
+  log_level: "INFO"
+  track_metrics:
+    - "train_loss"
+    - "val_loss"
+    - "mse_loss"
+    - "divergence_loss"
+    - "boundary_loss"
+    - "learning_rate"

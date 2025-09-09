@@ -8,7 +8,8 @@
 #SBATCH --mem=96G
 #SBATCH --time=24:00:00
 #SBATCH --output=R-%x.%j.out
-#SBATCH --gres=gpu:2
+#SBATCH --gres=gpu:1
+#SBATCH --exclude gpu01
 
 # Get the git branch from command-line argument or use spectral-norm as default
 GIT_BRANCH=${1:-master}

@@ -13,35 +13,32 @@ from unet_fno_model import UNetFNO, compute_physics_losses, count_parameters
 
 
 class UNetFNOTrainer:
-    """Streamlined trainer for U-Net-FNO model"""
-    
-    def __init__(self, model, device='cuda', learning_rate=1e-4, 
+    def __init__(self, model, device='cuda', learning_rate=2e-4, 
                  physics_weights=None, use_mixed_precision=False):
         self.model = model.to(device)
         self.device = device
         self.use_mixed_precision = use_mixed_precision
         
-        # Default physics weights
+        # Simplified physics weights - no spectral loss
         if physics_weights is None:
             physics_weights = {
                 'mse': 1.0,
-                'divergence': 0.1,
-                'boundary': 0.05,
-                'spectral': 0.1
+                'divergence': 0.01,
+                'boundary': 0.001
             }
         self.physics_weights = physics_weights
         
-        # Optimizer with warm restart
+        # Optimizer with lighter regularization
         self.optimizer = optim.AdamW(
             model.parameters(), 
             lr=learning_rate, 
-            weight_decay=1e-4,
+            weight_decay=1e-5,  # Reduced weight decay
             betas=(0.9, 0.999)
         )
         
-        # Cosine annealing scheduler
+        # Cosine annealing scheduler with higher minimum
         self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer, T_max=50, eta_min=1e-6
+            self.optimizer, T_max=75, eta_min=1e-5
         )
         
         # Mixed precision
@@ -58,7 +55,6 @@ class UNetFNOTrainer:
             self.history['physics_losses'][key] = []
         
     def compute_loss(self, pred_velocity, true_velocity, input_data):
-        """Compute combined loss"""
         physics_losses = compute_physics_losses(pred_velocity, true_velocity, input_data)
         
         total_loss = 0
@@ -74,7 +70,6 @@ class UNetFNOTrainer:
         return total_loss, loss_dict
     
     def train_epoch(self, train_loader, epoch):
-        """Train for one epoch"""
         self.model.train()
         epoch_losses = {key: 0 for key in self.physics_weights.keys()}
         epoch_losses['total'] = 0
@@ -92,7 +87,7 @@ class UNetFNOTrainer:
                 
                 self.scaler.scale(total_loss).backward()
                 self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
@@ -100,7 +95,7 @@ class UNetFNOTrainer:
                 total_loss, losses = self.compute_loss(pred_batch, target_batch, input_batch)
                 
                 total_loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
                 self.optimizer.step()
             
             # Accumulate losses
@@ -118,7 +113,6 @@ class UNetFNOTrainer:
         return epoch_losses
     
     def validate(self, val_data):
-        """Validate on held-out data"""
         if val_data is None:
             return None
         
@@ -130,7 +124,7 @@ class UNetFNOTrainer:
         num_batches = 0
         
         with torch.no_grad():
-            batch_size = 32
+            batch_size = 64  # Larger batch for validation
             for i in range(0, len(val_input), batch_size):
                 end_idx = min(i + batch_size, len(val_input))
                 
@@ -150,15 +144,16 @@ class UNetFNOTrainer:
         
         return total_losses
     
-    def create_visualizations(self, val_data, epoch, num_samples=4):
-        """Create visualization of predictions"""
+    def create_tensorboard_visualizations(self, val_data, epoch, writer, num_samples=4):
+        """Create comprehensive velocity visualizations for TensorBoard"""
         if val_data is None:
             return None
         
         self.model.eval()
         val_input, val_target = val_data
         
-        # Select random samples
+        # Fixed indices for consistent comparison across epochs
+        np.random.seed(42)  # Fixed seed for consistent samples
         indices = np.random.choice(len(val_input), min(num_samples, len(val_input)), replace=False)
         
         sample_input = torch.tensor(val_input[indices], dtype=torch.float32).to(self.device)
@@ -167,12 +162,184 @@ class UNetFNOTrainer:
         with torch.no_grad():
             sample_pred = self.model(sample_input)
         
-        # Convert to numpy
         input_np = sample_input.cpu().numpy()
         target_np = sample_target.cpu().numpy()
         pred_np = sample_pred.cpu().numpy()
         
-        # Create visualization grid
+        # Create comprehensive visualization grid
+        fig, axes = plt.subplots(num_samples, 8, figsize=(32, 4*num_samples))
+        if num_samples == 1:
+            axes = axes.reshape(1, -1)
+        
+        for i in range(num_samples):
+            # Input fields
+            im1 = axes[i, 0].imshow(input_np[i, 0], cmap='viridis', aspect='equal')
+            axes[i, 0].set_title(f'Sample {i+1}\nPressure Input', fontsize=10)
+            axes[i, 0].axis('off')
+            plt.colorbar(im1, ax=axes[i, 0], fraction=0.046, pad=0.04)
+            
+            im2 = axes[i, 1].imshow(input_np[i, 1], cmap='plasma', aspect='equal')
+            axes[i, 1].set_title('WSS Input', fontsize=10)
+            axes[i, 1].axis('off')
+            plt.colorbar(im2, ax=axes[i, 1], fraction=0.046, pad=0.04)
+            
+            # U-velocity comparison (maintain same color scale)
+            u_min, u_max = target_np[i, 0].min(), target_np[i, 0].max()
+            
+            im3 = axes[i, 2].imshow(target_np[i, 0], cmap='coolwarm', vmin=u_min, vmax=u_max, aspect='equal')
+            axes[i, 2].set_title('True U-velocity', fontsize=10)
+            axes[i, 2].axis('off')
+            plt.colorbar(im3, ax=axes[i, 2], fraction=0.046, pad=0.04)
+            
+            im4 = axes[i, 3].imshow(pred_np[i, 0], cmap='coolwarm', vmin=u_min, vmax=u_max, aspect='equal')
+            axes[i, 3].set_title('Pred U-velocity', fontsize=10)
+            axes[i, 3].axis('off')
+            plt.colorbar(im4, ax=axes[i, 3], fraction=0.046, pad=0.04)
+            
+            # V-velocity comparison (maintain same color scale)
+            v_min, v_max = target_np[i, 1].min(), target_np[i, 1].max()
+            
+            im5 = axes[i, 4].imshow(target_np[i, 1], cmap='coolwarm', vmin=v_min, vmax=v_max, aspect='equal')
+            axes[i, 4].set_title('True V-velocity', fontsize=10)
+            axes[i, 4].axis('off')
+            plt.colorbar(im5, ax=axes[i, 4], fraction=0.046, pad=0.04)
+            
+            im6 = axes[i, 5].imshow(pred_np[i, 1], cmap='coolwarm', vmin=v_min, vmax=v_max, aspect='equal')
+            axes[i, 5].set_title('Pred V-velocity', fontsize=10)
+            axes[i, 5].axis('off')
+            plt.colorbar(im6, ax=axes[i, 5], fraction=0.046, pad=0.04)
+            
+            # Error maps
+            u_error = np.abs(target_np[i, 0] - pred_np[i, 0])
+            v_error = np.abs(target_np[i, 1] - pred_np[i, 1])
+            
+            im7 = axes[i, 6].imshow(u_error, cmap='Reds', aspect='equal')
+            u_mae = np.mean(u_error)
+            axes[i, 6].set_title(f'U-velocity Error\nMAE: {u_mae:.4f}', fontsize=10)
+            axes[i, 6].axis('off')
+            plt.colorbar(im7, ax=axes[i, 6], fraction=0.046, pad=0.04)
+            
+            im8 = axes[i, 7].imshow(v_error, cmap='Reds', aspect='equal')
+            v_mae = np.mean(v_error)
+            axes[i, 7].set_title(f'V-velocity Error\nMAE: {v_mae:.4f}', fontsize=10)
+            axes[i, 7].axis('off')
+            plt.colorbar(im8, ax=axes[i, 7], fraction=0.046, pad=0.04)
+        
+        plt.tight_layout()
+        
+        # Add to TensorBoard
+        writer.add_figure('Validation/Velocity_Comparisons', fig, epoch)
+        
+        # Save individual images to TensorBoard for easier viewing
+        for i in range(num_samples):
+            # Input fields
+            writer.add_image(f'Sample_{i+1}/Input_Pressure', 
+                           self._normalize_for_tensorboard(input_np[i, 0]), epoch)
+            writer.add_image(f'Sample_{i+1}/Input_WSS', 
+                           self._normalize_for_tensorboard(input_np[i, 1]), epoch)
+            
+            # U-velocity
+            writer.add_image(f'Sample_{i+1}/U_True', 
+                           self._normalize_for_tensorboard(target_np[i, 0]), epoch)
+            writer.add_image(f'Sample_{i+1}/U_Pred', 
+                           self._normalize_for_tensorboard(pred_np[i, 0]), epoch)
+            writer.add_image(f'Sample_{i+1}/U_Error', 
+                           self._normalize_for_tensorboard(u_error), epoch)
+            
+            # V-velocity
+            writer.add_image(f'Sample_{i+1}/V_True', 
+                           self._normalize_for_tensorboard(target_np[i, 1]), epoch)
+            writer.add_image(f'Sample_{i+1}/V_Pred', 
+                           self._normalize_for_tensorboard(pred_np[i, 1]), epoch)
+            writer.add_image(f'Sample_{i+1}/V_Error', 
+                           self._normalize_for_tensorboard(v_error), epoch)
+        
+        # Compute and log validation metrics
+        self._log_validation_metrics(target_np, pred_np, writer, epoch)
+        
+        plt.close()
+        return fig
+    
+    def _normalize_for_tensorboard(self, image):
+        """Normalize image for TensorBoard display"""
+        # Normalize to [0, 1] for TensorBoard
+        img_min, img_max = image.min(), image.max()
+        if img_max > img_min:
+            normalized = (image - img_min) / (img_max - img_min)
+        else:
+            normalized = np.zeros_like(image)
+        
+        # Add channel dimension and convert to tensor
+        return torch.tensor(normalized).unsqueeze(0)
+    
+    def _log_validation_metrics(self, target_np, pred_np, writer, epoch):
+        """Log detailed validation metrics to TensorBoard"""
+        
+        # Compute metrics for both velocity components
+        u_true, u_pred = target_np[:, 0], pred_np[:, 0]
+        v_true, v_pred = target_np[:, 1], pred_np[:, 1]
+        
+        # MAE metrics
+        u_mae = np.mean(np.abs(u_true - u_pred))
+        v_mae = np.mean(np.abs(v_true - v_pred))
+        total_mae = (u_mae + v_mae) / 2
+        
+        # MSE metrics
+        u_mse = np.mean((u_true - u_pred) ** 2)
+        v_mse = np.mean((v_true - v_pred) ** 2)
+        total_mse = (u_mse + v_mse) / 2
+        
+        # Correlation metrics
+        u_corr = np.corrcoef(u_true.flatten(), u_pred.flatten())[0, 1]
+        v_corr = np.corrcoef(v_true.flatten(), v_pred.flatten())[0, 1]
+        
+        # Velocity magnitude metrics
+        mag_true = np.sqrt(u_true**2 + v_true**2)
+        mag_pred = np.sqrt(u_pred**2 + v_pred**2)
+        mag_mae = np.mean(np.abs(mag_true - mag_pred))
+        mag_corr = np.corrcoef(mag_true.flatten(), mag_pred.flatten())[0, 1]
+        
+        # Log to TensorBoard
+        writer.add_scalar('Validation_Metrics/U_MAE', u_mae, epoch)
+        writer.add_scalar('Validation_Metrics/V_MAE', v_mae, epoch)
+        writer.add_scalar('Validation_Metrics/Total_MAE', total_mae, epoch)
+        
+        writer.add_scalar('Validation_Metrics/U_MSE', u_mse, epoch)
+        writer.add_scalar('Validation_Metrics/V_MSE', v_mse, epoch)
+        writer.add_scalar('Validation_Metrics/Total_MSE', total_mse, epoch)
+        
+        writer.add_scalar('Validation_Metrics/U_Correlation', u_corr, epoch)
+        writer.add_scalar('Validation_Metrics/V_Correlation', v_corr, epoch)
+        
+        writer.add_scalar('Validation_Metrics/Magnitude_MAE', mag_mae, epoch)
+        writer.add_scalar('Validation_Metrics/Magnitude_Correlation', mag_corr, epoch)
+        
+        # Log detailed statistics
+        logging.info(f"Validation Metrics - Epoch {epoch}:")
+        logging.info(f"  U-velocity: MAE={u_mae:.4f}, MSE={u_mse:.4f}, Corr={u_corr:.3f}")
+        logging.info(f"  V-velocity: MAE={v_mae:.4f}, MSE={v_mse:.4f}, Corr={v_corr:.3f}")
+        logging.info(f"  Magnitude: MAE={mag_mae:.4f}, Corr={mag_corr:.3f}")
+    
+    def create_visualizations(self, val_data, epoch, num_samples=4):
+        """Legacy method - kept for compatibility"""
+        if val_data is None:
+            return None
+        
+        self.model.eval()
+        val_input, val_target = val_data
+        
+        indices = np.random.choice(len(val_input), min(num_samples, len(val_input)), replace=False)
+        
+        sample_input = torch.tensor(val_input[indices], dtype=torch.float32).to(self.device)
+        sample_target = torch.tensor(val_target[indices], dtype=torch.float32).to(self.device)
+        
+        with torch.no_grad():
+            sample_pred = self.model(sample_input)
+        
+        input_np = sample_input.cpu().numpy()
+        target_np = sample_target.cpu().numpy()
+        pred_np = sample_pred.cpu().numpy()
+        
         fig, axes = plt.subplots(num_samples, 5, figsize=(20, 4*num_samples))
         if num_samples == 1:
             axes = axes.reshape(1, -1)
@@ -210,41 +377,30 @@ class UNetFNOTrainer:
         
         return fig
     
-    def train(self, train_loader, val_data=None, epochs=100, save_dir='./models', 
-              log_dir='./logs', save_interval=10, validation_interval=5):
-        """Main training loop"""
+    def train(self, train_loader, val_data=None, epochs=150, save_dir='./models', 
+              log_dir='./logs', save_interval=15, validation_interval=5):
         
         os.makedirs(save_dir, exist_ok=True)
         os.makedirs(log_dir, exist_ok=True)
         
-        # TensorBoard writer
         writer = SummaryWriter(log_dir)
         logging.info(f"TensorBoard logging enabled. View with: tensorboard --logdir={log_dir}")
         
         best_val_loss = float('inf')
         
-        logging.info(f"Starting training for {epochs} epochs")
+        logging.info(f"Starting simplified training for {epochs} epochs")
         logging.info(f"Model parameters: {count_parameters(self.model):,}")
         
-        # Log model architecture to TensorBoard
+        # Log model info
         writer.add_text('Model/Architecture', f"""
-        U-Net-FNO Model Configuration:
-        - Input channels: {getattr(self.model, 'in_channels', 2)}
-        - Output channels: {getattr(self.model, 'out_channels', 2)}  
-        - Base channels: {getattr(self.model, 'base_channels', 64)}
-        - Depth: {getattr(self.model, 'depth', 4)}
-        - FNO modes: {getattr(self.model, 'modes', 16)}
-        - Incompressible flow: {getattr(self.model, 'enforce_incompressible', True)}
+        Simplified U-Net-FNO Model:
+        - Depth: 3 (reduced from 4)
+        - FNO modes: 12 (reduced from 16)  
+        - Base channels: 64
+        - Removed spectral loss
+        - Reduced physics weights
         - Total parameters: {count_parameters(self.model):,}
         """, 0)
-        
-        # Log physics weights
-        physics_text = "Physics Loss Weights:\n"
-        for key, value in self.physics_weights.items():
-            physics_text += f"- {key}: {value}\n"
-        writer.add_text('Training/Physics_Weights', physics_text, 0)
-        
-        writer.flush()
         
         for epoch in range(epochs):
             start_time = time.time()
@@ -270,7 +426,6 @@ class UNetFNOTrainer:
                 if val_losses:
                     self.history['val_loss'].append(val_losses['total'])
                     
-                    # Save best model
                     if val_losses['total'] < best_val_loss:
                         best_val_loss = val_losses['total']
                         self.save_model(os.path.join(save_dir, 'best_model.pt'), epoch)
@@ -279,19 +434,17 @@ class UNetFNOTrainer:
             writer.add_scalar('Loss/Train', train_losses['total'], epoch)
             writer.add_scalar('Learning_Rate', current_lr, epoch)
             
-            # Log individual physics losses
             for key, value in train_losses.items():
                 if key != 'total':
                     writer.add_scalar(f'Train_Physics/{key}', value, epoch)
             
             if val_losses:
                 writer.add_scalar('Loss/Validation', val_losses['total'], epoch)
-                # Log validation physics losses too
                 for key, value in val_losses.items():
                     if key != 'total':
                         writer.add_scalar(f'Val_Physics/{key}', value, epoch)
             
-            # Log gradient norms for monitoring
+            # Log gradient norms
             total_norm = 0
             for p in self.model.parameters():
                 if p.grad is not None:
@@ -300,12 +453,11 @@ class UNetFNOTrainer:
             total_norm = total_norm ** (1. / 2)
             writer.add_scalar('Gradients/Total_Norm', total_norm, epoch)
             
-            # Flush TensorBoard data every epoch
             writer.flush()
             
-            # Visualizations
+            # Enhanced TensorBoard visualizations with both velocity components
             if (epoch + 1) % validation_interval == 0:
-                self.create_visualizations(val_data, epoch)
+                self.create_tensorboard_visualizations(val_data, epoch, writer, num_samples=4)
             
             # Save checkpoint
             if (epoch + 1) % save_interval == 0:
@@ -325,14 +477,6 @@ class UNetFNOTrainer:
         return self.history
     
     def save_model(self, filepath, epoch, **kwargs):
-        """Save comprehensive model checkpoint"""
-        
-        # Collect additional metrics if provided
-        metrics = {}
-        for key, value in kwargs.items():
-            if value is not None:
-                metrics[key] = value
-        
         checkpoint = {
             'epoch': epoch,
             'model_state_dict': self.model.state_dict(),
@@ -340,179 +484,42 @@ class UNetFNOTrainer:
             'scheduler_state_dict': self.scheduler.state_dict(),
             'history': self.history,
             'physics_weights': self.physics_weights,
-            'metrics': metrics,
             'timestamp': datetime.now().isoformat(),
             'model_config': {
-                'in_channels': getattr(self.model, 'in_channels', 2),
-                'out_channels': getattr(self.model, 'out_channels', 2),
-                'base_channels': getattr(self.model, 'base_channels', 64),
-                'depth': getattr(self.model, 'depth', 4),
-                'modes': getattr(self.model, 'modes', 16),
-                'enforce_incompressible': getattr(self.model, 'enforce_incompressible', True)
+                'in_channels': 2,
+                'out_channels': 2,
+                'base_channels': 64,
+                'depth': 3,
+                'modes': 12
             }
         }
         
-        # Add scaler state if using mixed precision
         if hasattr(self, 'scaler'):
             checkpoint['scaler_state_dict'] = self.scaler.state_dict()
         
         torch.save(checkpoint, filepath)
-        
-        # Log checkpoint details
-        checkpoint_info = f"Checkpoint saved: {os.path.basename(filepath)}"
-        if 'is_best' in kwargs:
-            checkpoint_info += " (BEST MODEL)"
-        logging.info(checkpoint_info)
+        logging.info(f"Checkpoint saved: {os.path.basename(filepath)}")
     
     def load_model(self, filepath):
-        """Load comprehensive model checkpoint"""
-        
         if not os.path.exists(filepath):
             raise FileNotFoundError(f"Checkpoint not found: {filepath}")
         
-        logging.info(f"Loading checkpoint: {filepath}")
         checkpoint = torch.load(filepath, map_location=self.device)
-        
-        # Load model state
         self.model.load_state_dict(checkpoint['model_state_dict'])
         
-        # Load optimizer and scheduler states
         if 'optimizer_state_dict' in checkpoint:
             self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         
         if 'scheduler_state_dict' in checkpoint:
             self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         
-        # Load scaler if present
         if 'scaler_state_dict' in checkpoint and hasattr(self, 'scaler'):
             self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
         
-        # Load training history
         if 'history' in checkpoint:
             self.history = checkpoint['history']
-            logging.info(f"Loaded training history with {len(self.history['train_loss'])} epochs")
         
-        # Load physics weights
-        if 'physics_weights' in checkpoint:
-            self.physics_weights = checkpoint['physics_weights']
-        
-        # Log checkpoint info
         epoch = checkpoint.get('epoch', -1)
-        timestamp = checkpoint.get('timestamp', 'unknown')
-        metrics = checkpoint.get('metrics', {})
+        logging.info(f"Model loaded from epoch {epoch + 1}")
         
-        logging.info(f"Checkpoint loaded successfully:")
-        logging.info(f"  Epoch: {epoch + 1}")
-        logging.info(f"  Saved: {timestamp}")
-        if metrics:
-            for key, value in metrics.items():
-                logging.info(f"  {key}: {value:.6f}")
-        
-        return epoch + 1  # Return next epoch to start from
-    
-    def save_training_plots(self, save_dir, epoch):
-        """Save training progress plots"""
-        
-        try:
-            fig, axes = plt.subplots(2, 2, figsize=(15, 10))
-            
-            # Training and validation loss
-            epochs_range = range(1, len(self.history['train_loss']) + 1)
-            axes[0, 0].plot(epochs_range, self.history['train_loss'], 'b-', label='Training Loss')
-            if self.history['val_loss']:
-                val_epochs = range(5, len(self.history['val_loss']) * 5 + 1, 5)  # validation_interval = 5
-                axes[0, 0].plot(val_epochs, self.history['val_loss'], 'r-', label='Validation Loss')
-            axes[0, 0].set_xlabel('Epoch')
-            axes[0, 0].set_ylabel('Loss')
-            axes[0, 0].set_title('Training Progress')
-            axes[0, 0].legend()
-            axes[0, 0].grid(True, alpha=0.3)
-            
-            # Physics losses
-            for key in ['mse', 'divergence', 'boundary', 'spectral']:
-                if key in self.history['physics_losses'] and self.history['physics_losses'][key]:
-                    axes[0, 1].plot(epochs_range, self.history['physics_losses'][key], 
-                                   label=key.title())
-            axes[0, 1].set_xlabel('Epoch')
-            axes[0, 1].set_ylabel('Loss')
-            axes[0, 1].set_title('Physics Loss Components')
-            axes[0, 1].legend()
-            axes[0, 1].grid(True, alpha=0.3)
-            axes[0, 1].set_yscale('log')
-            
-            # Learning rate
-            axes[1, 0].plot(epochs_range, self.history['learning_rate'], 'g-')
-            axes[1, 0].set_xlabel('Epoch')
-            axes[1, 0].set_ylabel('Learning Rate')
-            axes[1, 0].set_title('Learning Rate Schedule')
-            axes[1, 0].set_yscale('log')
-            axes[1, 0].grid(True, alpha=0.3)
-            
-            # Loss ratio (if validation available)
-            if self.history['val_loss'] and len(self.history['val_loss']) > 1:
-                train_interp = np.interp(val_epochs, epochs_range, self.history['train_loss'])
-                loss_ratio = np.array(self.history['val_loss']) / train_interp
-                axes[1, 1].plot(val_epochs, loss_ratio, 'm-')
-                axes[1, 1].set_xlabel('Epoch')
-                axes[1, 1].set_ylabel('Val Loss / Train Loss')
-                axes[1, 1].set_title('Overfitting Monitor')
-                axes[1, 1].grid(True, alpha=0.3)
-            else:
-                axes[1, 1].text(0.5, 0.5, 'Validation data\nnot available', 
-                               ha='center', va='center', transform=axes[1, 1].transAxes)
-                axes[1, 1].set_title('Overfitting Monitor')
-            
-            plt.tight_layout()
-            plot_path = os.path.join(save_dir, f'training_progress_epoch_{epoch+1}.png')
-            plt.savefig(plot_path, dpi=150, bbox_inches='tight')
-            plt.close()
-            
-            logging.info(f"Training plots saved: {plot_path}")
-            
-        except Exception as e:
-            logging.warning(f"Failed to save training plots: {e}")
-    
-    def create_checkpoint_summary(self, save_dir):
-        """Create a summary of all checkpoints"""
-        
-        try:
-            checkpoint_files = []
-            for filename in os.listdir(save_dir):
-                if filename.endswith('.pt'):
-                    filepath = os.path.join(save_dir, filename)
-                    try:
-                        checkpoint = torch.load(filepath, map_location='cpu')
-                        info = {
-                            'filename': filename,
-                            'epoch': checkpoint.get('epoch', -1),
-                            'timestamp': checkpoint.get('timestamp', 'unknown'),
-                            'metrics': checkpoint.get('metrics', {})
-                        }
-                        checkpoint_files.append(info)
-                    except:
-                        continue
-            
-            # Sort by epoch
-            checkpoint_files.sort(key=lambda x: x['epoch'])
-            
-            # Write summary
-            summary_path = os.path.join(save_dir, 'checkpoint_summary.txt')
-            with open(summary_path, 'w') as f:
-                f.write("CHECKPOINT SUMMARY\n")
-                f.write("=" * 50 + "\n\n")
-                
-                for info in checkpoint_files:
-                    f.write(f"File: {info['filename']}\n")
-                    f.write(f"Epoch: {info['epoch'] + 1}\n")
-                    f.write(f"Timestamp: {info['timestamp']}\n")
-                    
-                    if info['metrics']:
-                        f.write("Metrics:\n")
-                        for key, value in info['metrics'].items():
-                            f.write(f"  {key}: {value:.6f}\n")
-                    f.write("\n" + "-" * 30 + "\n\n")
-            
-            logging.info(f"Checkpoint summary saved: {summary_path}")
-            
-        except Exception as e:
-            logging.warning(f"Failed to create checkpoint summary: {e}")
+        return epoch + 1
