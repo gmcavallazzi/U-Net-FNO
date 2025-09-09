@@ -9,36 +9,41 @@ import time
 import logging
 from datetime import datetime
 
-from unet_fno_model import UNetFNO, compute_physics_losses, count_parameters
+from unet_fno_model import UNetFNO, compute_multiscale_physics_losses, count_parameters
 
 
 class UNetFNOTrainer:
     def __init__(self, model, device='cuda', learning_rate=2e-4, 
-                 physics_weights=None, use_mixed_precision=False):
+                 physics_weights=None, use_mixed_precision=False, noise_std=0.02):
         self.model = model.to(device)
         self.device = device
         self.use_mixed_precision = use_mixed_precision
+        self.noise_std = noise_std
         
-        # Simplified physics weights - no spectral loss
+        # Physics weights for multi-scale training
         if physics_weights is None:
             physics_weights = {
-                'mse': 1.0,
-                'divergence': 0.01,
-                'boundary': 0.001
+                'mse': 0.7,
+                'weighted_mse': 0.3,
+                'huber': 0.2,
+                'magnitude_l1': 0.1,
+                'divergence': 0.05,
+                'boundary': 0.001,
+                'frequency': 0.05
             }
         self.physics_weights = physics_weights
         
-        # Optimizer with lighter regularization
+        # Optimizer
         self.optimizer = optim.AdamW(
             model.parameters(), 
             lr=learning_rate, 
-            weight_decay=1e-5,  # Reduced weight decay
-            betas=(0.9, 0.999)
+            weight_decay=5e-6,
+            betas=(0.9, 0.95)
         )
         
-        # Cosine annealing scheduler with higher minimum
-        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer, T_max=75, eta_min=1e-5
+        # Learning rate scheduler with warm restarts
+        self.scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            self.optimizer, T_0=25, T_mult=2, eta_min=1e-6
         )
         
         # Mixed precision
@@ -54,11 +59,42 @@ class UNetFNOTrainer:
         for key in self.physics_weights.keys():
             self.history['physics_losses'][key] = []
         
+        # High velocity sampling
+        self.high_velocity_threshold = 0.8
+        
+    def add_training_noise(self, input_data):
+        """Add gaussian noise to inputs during training"""
+        if self.training and self.noise_std > 0:
+            noise = torch.randn_like(input_data) * self.noise_std
+            return input_data + noise
+        return input_data
+    
+    def sample_high_velocity_regions(self, target_batch, sample_ratio=0.3):
+        """Sample more from high velocity regions during training"""
+        velocity_mag = torch.sqrt(target_batch[:, 0]**2 + target_batch[:, 1]**2)
+        high_vel_mask = velocity_mag > self.high_velocity_threshold
+        
+        # Create sampling weights
+        weights = torch.ones_like(velocity_mag)
+        weights[high_vel_mask] *= 3.0  # 3x more weight for high velocity regions
+        
+        return weights.unsqueeze(1)
+    
     def compute_loss(self, pred_velocity, true_velocity, input_data):
-        physics_losses = compute_physics_losses(pred_velocity, true_velocity, input_data)
+        physics_losses = compute_multiscale_physics_losses(pred_velocity, true_velocity, input_data)
         
         total_loss = 0
         loss_dict = {}
+        
+        # Apply high velocity region weighting to main losses
+        if self.training:
+            velocity_weights = self.sample_high_velocity_regions(true_velocity)
+            
+            # Apply weights to main reconstruction losses
+            if 'mse' in physics_losses:
+                mse_loss = physics_losses['mse']
+                weighted_mse = torch.mean(velocity_weights * (pred_velocity - true_velocity)**2)
+                physics_losses['mse'] = 0.7 * mse_loss + 0.3 * weighted_mse
         
         for key, weight in self.physics_weights.items():
             if key in physics_losses:
@@ -74,9 +110,16 @@ class UNetFNOTrainer:
         epoch_losses = {key: 0 for key in self.physics_weights.keys()}
         epoch_losses['total'] = 0
         
+        # Progressive learning: reduce noise over time
+        current_noise = self.noise_std * max(0.1, 1.0 - epoch / 100)
+        
         for batch_idx, (input_batch, target_batch) in enumerate(train_loader):
             input_batch = input_batch.to(self.device)
             target_batch = target_batch.to(self.device)
+            
+            # Add training noise
+            if current_noise > 0:
+                input_batch = self.add_training_noise(input_batch)
             
             self.optimizer.zero_grad()
             
@@ -87,7 +130,7 @@ class UNetFNOTrainer:
                 
                 self.scaler.scale(total_loss).backward()
                 self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.3)
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
@@ -95,7 +138,7 @@ class UNetFNOTrainer:
                 total_loss, losses = self.compute_loss(pred_batch, target_batch, input_batch)
                 
                 total_loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.3)
                 self.optimizer.step()
             
             # Accumulate losses
@@ -104,7 +147,7 @@ class UNetFNOTrainer:
             
             if batch_idx % 20 == 0:
                 logging.info(f'Epoch {epoch}, Batch {batch_idx}/{len(train_loader)}, '
-                           f'Loss: {total_loss.item():.6f}')
+                           f'Loss: {total_loss.item():.6f}, Noise: {current_noise:.4f}')
         
         # Average losses
         for key in epoch_losses:
@@ -124,7 +167,7 @@ class UNetFNOTrainer:
         num_batches = 0
         
         with torch.no_grad():
-            batch_size = 64  # Larger batch for validation
+            batch_size = 64
             for i in range(0, len(val_input), batch_size):
                 end_idx = min(i + batch_size, len(val_input))
                 
@@ -145,15 +188,14 @@ class UNetFNOTrainer:
         return total_losses
     
     def create_tensorboard_visualizations(self, val_data, epoch, writer, num_samples=4):
-        """Create comprehensive velocity visualizations for TensorBoard"""
+        """Create visualizations with peak analysis"""
         if val_data is None:
             return None
         
         self.model.eval()
         val_input, val_target = val_data
         
-        # Fixed indices for consistent comparison across epochs
-        np.random.seed(42)  # Fixed seed for consistent samples
+        np.random.seed(42)
         indices = np.random.choice(len(val_input), min(num_samples, len(val_input)), replace=False)
         
         sample_input = torch.tensor(val_input[indices], dtype=torch.float32).to(self.device)
@@ -166,8 +208,8 @@ class UNetFNOTrainer:
         target_np = sample_target.cpu().numpy()
         pred_np = sample_pred.cpu().numpy()
         
-        # Create comprehensive visualization grid
-        fig, axes = plt.subplots(num_samples, 8, figsize=(32, 4*num_samples))
+        # Create visualization grid with peak analysis
+        fig, axes = plt.subplots(num_samples, 9, figsize=(36, 4*num_samples))
         if num_samples == 1:
             axes = axes.reshape(1, -1)
         
@@ -183,7 +225,7 @@ class UNetFNOTrainer:
             axes[i, 1].axis('off')
             plt.colorbar(im2, ax=axes[i, 1], fraction=0.046, pad=0.04)
             
-            # U-velocity comparison (maintain same color scale)
+            # U-velocity comparison
             u_min, u_max = target_np[i, 0].min(), target_np[i, 0].max()
             
             im3 = axes[i, 2].imshow(target_np[i, 0], cmap='coolwarm', vmin=u_min, vmax=u_max, aspect='equal')
@@ -196,7 +238,7 @@ class UNetFNOTrainer:
             axes[i, 3].axis('off')
             plt.colorbar(im4, ax=axes[i, 3], fraction=0.046, pad=0.04)
             
-            # V-velocity comparison (maintain same color scale)
+            # V-velocity comparison
             v_min, v_max = target_np[i, 1].min(), target_np[i, 1].max()
             
             im5 = axes[i, 4].imshow(target_np[i, 1], cmap='coolwarm', vmin=v_min, vmax=v_max, aspect='equal')
@@ -209,173 +251,122 @@ class UNetFNOTrainer:
             axes[i, 5].axis('off')
             plt.colorbar(im6, ax=axes[i, 5], fraction=0.046, pad=0.04)
             
-            # Error maps
+            # Error maps with peak analysis
             u_error = np.abs(target_np[i, 0] - pred_np[i, 0])
             v_error = np.abs(target_np[i, 1] - pred_np[i, 1])
             
             im7 = axes[i, 6].imshow(u_error, cmap='Reds', aspect='equal')
             u_mae = np.mean(u_error)
-            axes[i, 6].set_title(f'U-velocity Error\nMAE: {u_mae:.4f}', fontsize=10)
+            u_peak_error = np.max(u_error)
+            axes[i, 6].set_title(f'U Error\nMAE: {u_mae:.4f}\nPeak: {u_peak_error:.4f}', fontsize=10)
             axes[i, 6].axis('off')
             plt.colorbar(im7, ax=axes[i, 6], fraction=0.046, pad=0.04)
             
             im8 = axes[i, 7].imshow(v_error, cmap='Reds', aspect='equal')
             v_mae = np.mean(v_error)
-            axes[i, 7].set_title(f'V-velocity Error\nMAE: {v_mae:.4f}', fontsize=10)
+            v_peak_error = np.max(v_error)
+            axes[i, 7].set_title(f'V Error\nMAE: {v_mae:.4f}\nPeak: {v_peak_error:.4f}', fontsize=10)
             axes[i, 7].axis('off')
             plt.colorbar(im8, ax=axes[i, 7], fraction=0.046, pad=0.04)
+            
+            # Velocity magnitude comparison with peak analysis
+            true_mag = np.sqrt(target_np[i, 0]**2 + target_np[i, 1]**2)
+            pred_mag = np.sqrt(pred_np[i, 0]**2 + pred_np[i, 1]**2)
+            mag_error = np.abs(true_mag - pred_mag)
+            
+            im9 = axes[i, 8].imshow(mag_error, cmap='Reds', aspect='equal')
+            mag_mae = np.mean(mag_error)
+            max_true_mag = np.max(true_mag)
+            max_pred_mag = np.max(pred_mag)
+            axes[i, 8].set_title(f'Mag Error\nMAE: {mag_mae:.4f}\nTrue Max: {max_true_mag:.3f}\nPred Max: {max_pred_mag:.3f}', fontsize=9)
+            axes[i, 8].axis('off')
+            plt.colorbar(im9, ax=axes[i, 8], fraction=0.046, pad=0.04)
         
         plt.tight_layout()
         
         # Add to TensorBoard
-        writer.add_figure('Validation/Velocity_Comparisons', fig, epoch)
+        writer.add_figure('Validation/Velocity_Comparisons_with_Peaks', fig, epoch)
         
-        # Save individual images to TensorBoard for easier viewing
-        for i in range(num_samples):
-            # Input fields
-            writer.add_image(f'Sample_{i+1}/Input_Pressure', 
-                           self._normalize_for_tensorboard(input_np[i, 0]), epoch)
-            writer.add_image(f'Sample_{i+1}/Input_WSS', 
-                           self._normalize_for_tensorboard(input_np[i, 1]), epoch)
-            
-            # U-velocity
-            writer.add_image(f'Sample_{i+1}/U_True', 
-                           self._normalize_for_tensorboard(target_np[i, 0]), epoch)
-            writer.add_image(f'Sample_{i+1}/U_Pred', 
-                           self._normalize_for_tensorboard(pred_np[i, 0]), epoch)
-            writer.add_image(f'Sample_{i+1}/U_Error', 
-                           self._normalize_for_tensorboard(u_error), epoch)
-            
-            # V-velocity
-            writer.add_image(f'Sample_{i+1}/V_True', 
-                           self._normalize_for_tensorboard(target_np[i, 1]), epoch)
-            writer.add_image(f'Sample_{i+1}/V_Pred', 
-                           self._normalize_for_tensorboard(pred_np[i, 1]), epoch)
-            writer.add_image(f'Sample_{i+1}/V_Error', 
-                           self._normalize_for_tensorboard(v_error), epoch)
-        
-        # Compute and log validation metrics
-        self._log_validation_metrics(target_np, pred_np, writer, epoch)
+        # Log validation metrics with peak analysis
+        self._log_validation_metrics_with_peaks(target_np, pred_np, writer, epoch)
         
         plt.close()
         return fig
     
-    def _normalize_for_tensorboard(self, image):
-        """Normalize image for TensorBoard display"""
-        # Normalize to [0, 1] for TensorBoard
-        img_min, img_max = image.min(), image.max()
-        if img_max > img_min:
-            normalized = (image - img_min) / (img_max - img_min)
-        else:
-            normalized = np.zeros_like(image)
+    def _log_validation_metrics_with_peaks(self, target_np, pred_np, writer, epoch):
+        """Log validation metrics with peak analysis"""
         
-        # Add channel dimension and convert to tensor
-        return torch.tensor(normalized).unsqueeze(0)
-    
-    def _log_validation_metrics(self, target_np, pred_np, writer, epoch):
-        """Log detailed validation metrics to TensorBoard"""
-        
-        # Compute metrics for both velocity components
+        # Standard metrics
         u_true, u_pred = target_np[:, 0], pred_np[:, 0]
         v_true, v_pred = target_np[:, 1], pred_np[:, 1]
         
-        # MAE metrics
         u_mae = np.mean(np.abs(u_true - u_pred))
         v_mae = np.mean(np.abs(v_true - v_pred))
-        total_mae = (u_mae + v_mae) / 2
-        
-        # MSE metrics
         u_mse = np.mean((u_true - u_pred) ** 2)
         v_mse = np.mean((v_true - v_pred) ** 2)
-        total_mse = (u_mse + v_mse) / 2
         
-        # Correlation metrics
         u_corr = np.corrcoef(u_true.flatten(), u_pred.flatten())[0, 1]
         v_corr = np.corrcoef(v_true.flatten(), v_pred.flatten())[0, 1]
         
-        # Velocity magnitude metrics
+        # Peak analysis
+        u_true_max = np.max(np.abs(u_true))
+        u_pred_max = np.max(np.abs(u_pred))
+        v_true_max = np.max(np.abs(v_true))
+        v_pred_max = np.max(np.abs(v_pred))
+        
+        # Peak preservation ratio
+        u_peak_ratio = u_pred_max / (u_true_max + 1e-8)
+        v_peak_ratio = v_pred_max / (v_true_max + 1e-8)
+        
+        # High velocity region analysis
         mag_true = np.sqrt(u_true**2 + v_true**2)
         mag_pred = np.sqrt(u_pred**2 + v_pred**2)
-        mag_mae = np.mean(np.abs(mag_true - mag_pred))
-        mag_corr = np.corrcoef(mag_true.flatten(), mag_pred.flatten())[0, 1]
         
-        # Log to TensorBoard
+        # Find high velocity regions (top 10%)
+        high_vel_threshold = np.percentile(mag_true, 90)
+        high_vel_mask = mag_true > high_vel_threshold
+        
+        if np.any(high_vel_mask):
+            high_vel_mae = np.mean(np.abs(mag_true[high_vel_mask] - mag_pred[high_vel_mask]))
+            high_vel_corr = np.corrcoef(mag_true[high_vel_mask].flatten(), 
+                                       mag_pred[high_vel_mask].flatten())[0, 1]
+        else:
+            high_vel_mae = 0
+            high_vel_corr = 1
+        
+        # Standard metrics
         writer.add_scalar('Validation_Metrics/U_MAE', u_mae, epoch)
         writer.add_scalar('Validation_Metrics/V_MAE', v_mae, epoch)
-        writer.add_scalar('Validation_Metrics/Total_MAE', total_mae, epoch)
-        
         writer.add_scalar('Validation_Metrics/U_MSE', u_mse, epoch)
         writer.add_scalar('Validation_Metrics/V_MSE', v_mse, epoch)
-        writer.add_scalar('Validation_Metrics/Total_MSE', total_mse, epoch)
-        
         writer.add_scalar('Validation_Metrics/U_Correlation', u_corr, epoch)
         writer.add_scalar('Validation_Metrics/V_Correlation', v_corr, epoch)
         
+        # Peak analysis metrics
+        writer.add_scalar('Peak_Analysis/U_True_Max', u_true_max, epoch)
+        writer.add_scalar('Peak_Analysis/U_Pred_Max', u_pred_max, epoch)
+        writer.add_scalar('Peak_Analysis/V_True_Max', v_true_max, epoch)
+        writer.add_scalar('Peak_Analysis/V_Pred_Max', v_pred_max, epoch)
+        writer.add_scalar('Peak_Analysis/U_Peak_Ratio', u_peak_ratio, epoch)
+        writer.add_scalar('Peak_Analysis/V_Peak_Ratio', v_peak_ratio, epoch)
+        
+        # High velocity region metrics
+        writer.add_scalar('High_Velocity/MAE', high_vel_mae, epoch)
+        writer.add_scalar('High_Velocity/Correlation', high_vel_corr, epoch)
+        writer.add_scalar('High_Velocity/Threshold', high_vel_threshold, epoch)
+        
+        # Magnitude metrics
+        mag_mae = np.mean(np.abs(mag_true - mag_pred))
+        mag_corr = np.corrcoef(mag_true.flatten(), mag_pred.flatten())[0, 1]
         writer.add_scalar('Validation_Metrics/Magnitude_MAE', mag_mae, epoch)
         writer.add_scalar('Validation_Metrics/Magnitude_Correlation', mag_corr, epoch)
         
         # Log detailed statistics
-        logging.info(f"Validation Metrics - Epoch {epoch}:")
+        logging.info(f"Validation Metrics with Peak Analysis - Epoch {epoch}:")
         logging.info(f"  U-velocity: MAE={u_mae:.4f}, MSE={u_mse:.4f}, Corr={u_corr:.3f}")
         logging.info(f"  V-velocity: MAE={v_mae:.4f}, MSE={v_mse:.4f}, Corr={v_corr:.3f}")
-        logging.info(f"  Magnitude: MAE={mag_mae:.4f}, Corr={mag_corr:.3f}")
-    
-    def create_visualizations(self, val_data, epoch, num_samples=4):
-        """Legacy method - kept for compatibility"""
-        if val_data is None:
-            return None
-        
-        self.model.eval()
-        val_input, val_target = val_data
-        
-        indices = np.random.choice(len(val_input), min(num_samples, len(val_input)), replace=False)
-        
-        sample_input = torch.tensor(val_input[indices], dtype=torch.float32).to(self.device)
-        sample_target = torch.tensor(val_target[indices], dtype=torch.float32).to(self.device)
-        
-        with torch.no_grad():
-            sample_pred = self.model(sample_input)
-        
-        input_np = sample_input.cpu().numpy()
-        target_np = sample_target.cpu().numpy()
-        pred_np = sample_pred.cpu().numpy()
-        
-        fig, axes = plt.subplots(num_samples, 5, figsize=(20, 4*num_samples))
-        if num_samples == 1:
-            axes = axes.reshape(1, -1)
-        
-        for i in range(num_samples):
-            # Pressure input
-            axes[i, 0].imshow(input_np[i, 0], cmap='viridis', aspect='equal')
-            axes[i, 0].set_title('Pressure')
-            axes[i, 0].axis('off')
-            
-            # WSS input
-            axes[i, 1].imshow(input_np[i, 1], cmap='plasma', aspect='equal')
-            axes[i, 1].set_title('Wall Shear Stress')
-            axes[i, 1].axis('off')
-            
-            # True u-velocity
-            axes[i, 2].imshow(target_np[i, 0], cmap='coolwarm', aspect='equal')
-            axes[i, 2].set_title('True U-velocity')
-            axes[i, 2].axis('off')
-            
-            # Predicted u-velocity
-            axes[i, 3].imshow(pred_np[i, 0], cmap='coolwarm', aspect='equal')
-            axes[i, 3].set_title('Predicted U-velocity')
-            axes[i, 3].axis('off')
-            
-            # Error map
-            error = np.abs(target_np[i, 0] - pred_np[i, 0])
-            axes[i, 4].imshow(error, cmap='Reds', aspect='equal')
-            axes[i, 4].set_title('U-velocity Error')
-            axes[i, 4].axis('off')
-        
-        plt.tight_layout()
-        plt.savefig(f'visualization_epoch_{epoch}.png', dpi=150, bbox_inches='tight')
-        plt.close()
-        
-        return fig
+        logging.info(f"  Peak ratios: U={u_peak_ratio:.3f}, V={v_peak_ratio:.3f}")
+        logging.info(f"  High-vel regions: MAE={high_vel_mae:.4f}, Corr={high_vel_corr:.3f}")
     
     def train(self, train_loader, val_data=None, epochs=150, save_dir='./models', 
               log_dir='./logs', save_interval=15, validation_interval=5):
@@ -388,17 +379,19 @@ class UNetFNOTrainer:
         
         best_val_loss = float('inf')
         
-        logging.info(f"Starting simplified training for {epochs} epochs")
+        logging.info(f"Starting training for {epochs} epochs")
         logging.info(f"Model parameters: {count_parameters(self.model):,}")
         
         # Log model info
         writer.add_text('Model/Architecture', f"""
-        Simplified U-Net-FNO Model:
-        - Depth: 3 (reduced from 4)
-        - FNO modes: 12 (reduced from 16)  
-        - Base channels: 64
-        - Removed spectral loss
-        - Reduced physics weights
+        U-Net-FNO Model with Attention and Multi-scale Loss:
+        - Base channels: 96
+        - FNO modes: 16
+        - Attention gates in decoder
+        - Multi-layer output head with residual
+        - Multi-scale loss computation
+        - Peak preservation techniques
+        - Training noise: {self.noise_std}
         - Total parameters: {count_parameters(self.model):,}
         """, 0)
         
@@ -455,7 +448,7 @@ class UNetFNOTrainer:
             
             writer.flush()
             
-            # Enhanced TensorBoard visualizations with both velocity components
+            # Visualizations with peak analysis
             if (epoch + 1) % validation_interval == 0:
                 self.create_tensorboard_visualizations(val_data, epoch, writer, num_samples=4)
             
@@ -484,13 +477,15 @@ class UNetFNOTrainer:
             'scheduler_state_dict': self.scheduler.state_dict(),
             'history': self.history,
             'physics_weights': self.physics_weights,
+            'noise_std': self.noise_std,
             'timestamp': datetime.now().isoformat(),
             'model_config': {
                 'in_channels': 2,
                 'out_channels': 2,
-                'base_channels': 64,
+                'base_channels': 96,
                 'depth': 3,
-                'modes': 12
+                'modes': 16,
+                'use_attention': True
             }
         }
         
@@ -518,6 +513,9 @@ class UNetFNOTrainer:
         
         if 'history' in checkpoint:
             self.history = checkpoint['history']
+        
+        if 'noise_std' in checkpoint:
+            self.noise_std = checkpoint['noise_std']
         
         epoch = checkpoint.get('epoch', -1)
         logging.info(f"Model loaded from epoch {epoch + 1}")

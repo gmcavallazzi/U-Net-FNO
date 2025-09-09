@@ -1,4 +1,4 @@
-# Simplified U-Net-FNO Configuration for Fixed Training
+# U-Net-FNO Configuration for Peak Preservation and Multi-scale Training
 
 # Data parameters
 data:
@@ -6,49 +6,56 @@ data:
   validation_dir: ../GAN/validation_wss_dirty
   max_train: 11050
   max_val: 2781
-  batch_size: 32  # Increased batch size for stability
+  batch_size: 24  # Slightly reduced for larger model
   num_workers: 4
   pin_memory: true
   shape: [64, 64]
 
-# Model parameters
+# Model parameters with attention and increased capacity
 model:
   in_channels: 2
   out_channels: 2
-  base_channels: 64
-  depth: 3                    # Reduced from 4 to 3
-  modes: 12                   # Reduced from 16 to 12
-  enforce_incompressible: true # Keep this for physics
+  base_channels: 96           # Increased from 64
+  depth: 3
+  modes: 16                   # Increased from 12
+  enforce_incompressible: true
+  use_attention: true         # Attention gates in decoder
   
-# Training parameters
+# Training parameters with multi-scale loss
 training:
   epochs: 150
-  learning_rate: 0.0002       # Slightly higher learning rate
-  weight_decay: 0.00001       # Reduced weight decay
+  learning_rate: 0.0002
+  weight_decay: 0.000005      # Reduced weight decay
   use_mixed_precision: false
-  gradient_clipping: 0.5      # Reduced gradient clipping
+  gradient_clipping: 0.3      # Reduced from 0.5
+  noise_std: 0.02             # Training noise for robustness
   
-  # Simplified physics weights - REMOVED SPECTRAL LOSS
+  # Physics weights with peak preservation losses
   physics_weights:
-    mse: 1.0                  # Main reconstruction loss
-    divergence: 0.01          # Much smaller divergence weight
-    boundary: 0.001           # Much smaller boundary weight
+    mse: 0.7                  # Base reconstruction
+    weighted_mse: 0.3         # Emphasize high-velocity regions
+    huber: 0.2                # Peak preservation
+    magnitude_l1: 0.1         # Velocity magnitude preservation
+    divergence: 0.05          # Physics constraint
+    boundary: 0.001           # Boundary conditions
+    frequency: 0.05           # Frequency domain consistency
   
-  # Learning rate scheduling
-  scheduler_type: "CosineAnnealingLR"
-  T_max: 75                   # Reduced period
-  eta_min: 0.00001           # Higher minimum learning rate
+  # Learning rate scheduling with warm restarts
+  scheduler_type: "CosineAnnealingWarmRestarts"
+  T_0: 25                     # Initial restart period
+  T_mult: 2                   # Period multiplier
+  eta_min: 0.000001          # Minimum learning rate
   
   # Validation and saving
   validation_interval: 5
   save_interval: 15
-  visualization_interval: 5   # Not used anymore (only TensorBoard)
+  visualization_interval: 5
 
 # Output parameters
 output:
-  output_dir: ./results_unet_fno  # Fixed name to match main script
+  output_dir: ./results_unet_fno_attention
   save_best_model: true
-  save_visualizations: true       # Only applies to TensorBoard now
+  save_visualizations: true
   
 # Hardware optimization
 hardware:
@@ -61,7 +68,7 @@ reproducibility:
   seed: 42
   deterministic: true
 
-# Monitoring
+# Monitoring with peak analysis
 monitoring:
   tensorboard: true
   log_level: "INFO"
@@ -69,6 +76,12 @@ monitoring:
     - "train_loss"
     - "val_loss"
     - "mse_loss"
+    - "weighted_mse_loss"
+    - "huber_loss"
+    - "magnitude_l1_loss"
     - "divergence_loss"
     - "boundary_loss"
+    - "frequency_loss"
     - "learning_rate"
+    - "peak_analysis"
+    - "high_velocity_metrics"

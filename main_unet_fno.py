@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-Simplified U-Net-FNO Training Script
+U-Net-FNO Training Script with Peak Preservation
 
-Fixed the major issues:
-- Removed problematic spectral loss
-- Reduced model complexity  
-- Better gradient handling
-- Improved physics loss weights
+Key features:
+- Increased model capacity (96 channels, 16 modes)
+- Attention gates in decoder
+- Multi-scale loss functions
+- Peak preservation techniques
+- Training strategies for high-velocity regions
 """
 
 import os
@@ -26,14 +27,14 @@ from data_loader import (
 )
 from utils import setup_random_seeds, setup_logging, load_config
 
-# Import simplified components
+# Import components
 from unet_fno_model import UNetFNO
 from train_unet_fno import UNetFNOTrainer
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='Train Simplified U-Net-FNO')
-    parser.add_argument('--config', type=str, default='config_simplified.yaml',
+    parser = argparse.ArgumentParser(description='Train U-Net-FNO with Peak Preservation')
+    parser.add_argument('--config', type=str, default='config.yaml',
                        help='Path to YAML config file')
     parser.add_argument('--resume', type=str, default=None,
                        help='Resume from checkpoint')
@@ -45,6 +46,8 @@ def parse_args():
     parser.add_argument('--batch_size', type=int, default=None)
     parser.add_argument('--lr', type=float, default=None)
     parser.add_argument('--no_gpu', action='store_true')
+    parser.add_argument('--no_attention', action='store_true')
+    parser.add_argument('--noise_std', type=float, default=None)
     
     return parser.parse_args()
 
@@ -57,6 +60,10 @@ def merge_config_args(config, args):
         config['training']['learning_rate'] = args.lr
     if args.no_gpu:
         config['hardware']['use_gpu'] = False
+    if args.no_attention:
+        config['model']['use_attention'] = False
+    if args.noise_std is not None:
+        config['training']['noise_std'] = args.noise_std
     
     return config
 
@@ -66,7 +73,7 @@ def setup_directories(output_dir, experiment_name=None):
     if experiment_name:
         run_name = f"{experiment_name}_{timestamp}"
     else:
-        run_name = f"simplified_run_{timestamp}"
+        run_name = f"run_{timestamp}"
     
     run_dir = os.path.join(output_dir, run_name)
     models_dir = os.path.join(run_dir, "models")
@@ -103,7 +110,7 @@ def main():
         logging.info(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
     
     # Create directories
-    output_dir = config.get('output', {}).get('output_dir', './results_simplified_unet_fno')
+    output_dir = config.get('output', {}).get('output_dir', './results_unet_fno')
     run_dir, models_dir, logs_dir = setup_directories(output_dir, args.experiment_name)
     logging.info(f"Output directory: {run_dir}")
     
@@ -152,25 +159,31 @@ def main():
             val_data = (val_input, val_velocity)
             logging.info(f"Loaded validation data: {val_input.shape}")
     
-    # Create simplified model
+    # Create model with attention and increased capacity
     model_config = config['model']
     model = UNetFNO(
         in_channels=model_config.get('in_channels', 2),
         out_channels=model_config.get('out_channels', 2),
-        base_channels=model_config.get('base_channels', 64),
+        base_channels=model_config.get('base_channels', 96),
         depth=model_config.get('depth', 3),
-        modes=model_config.get('modes', 12),
-        enforce_incompressible=model_config.get('enforce_incompressible', True)
+        modes=model_config.get('modes', 16),
+        enforce_incompressible=model_config.get('enforce_incompressible', True),
+        use_attention=model_config.get('use_attention', True)
     )
     
-    logging.info(f"Simplified model created with {sum(p.numel() for p in model.parameters() if p.requires_grad):,} parameters")
+    param_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    logging.info(f"Model created with {param_count:,} parameters")
     
-    # Physics weights
+    # Physics weights with peak preservation
     training_config = config['training']
     physics_weights = training_config.get('physics_weights', {
-        'mse': 1.0,
-        'divergence': 0.01,
-        'boundary': 0.001
+        'mse': 0.7,
+        'weighted_mse': 0.3,
+        'huber': 0.2,
+        'magnitude_l1': 0.1,
+        'divergence': 0.05,
+        'boundary': 0.001,
+        'frequency': 0.05
     })
     
     # Create trainer
@@ -179,7 +192,8 @@ def main():
         device=device,
         learning_rate=training_config.get('learning_rate', 2e-4),
         physics_weights=physics_weights,
-        use_mixed_precision=training_config.get('use_mixed_precision', False)
+        use_mixed_precision=training_config.get('use_mixed_precision', False),
+        noise_std=training_config.get('noise_std', 0.02)
     )
     
     # Resume if requested
@@ -195,26 +209,37 @@ def main():
     save_interval = training_config.get('save_interval', 15)
     val_interval = training_config.get('validation_interval', 5)
     
-    logging.info("\n" + "="*60)
-    logging.info("SIMPLIFIED TRAINING CONFIGURATION")
-    logging.info("="*60)
+    logging.info("\n" + "="*70)
+    logging.info("U-NET-FNO TRAINING WITH PEAK PRESERVATION")
+    logging.info("="*70)
     logging.info(f"  Epochs: {epochs}")
     logging.info(f"  Batch size: {data_config['batch_size']}")
     logging.info(f"  Learning rate: {training_config['learning_rate']}")
     logging.info(f"  Device: {device}")
-    logging.info(f"  Model parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
-    logging.info("\nSimplified Model:")
-    logging.info(f"  Depth: 3 (reduced from 4)")
-    logging.info(f"  Fourier modes: 12 (reduced from 16)")
-    logging.info(f"  Base channels: 64")
-    logging.info("\nFixed Physics Losses:")
-    logging.info("  REMOVED: spectral loss (was causing overfitting)")
+    logging.info(f"  Model parameters: {param_count:,}")
+    logging.info(f"  Training noise std: {training_config.get('noise_std', 0.02)}")
+    logging.info("\nModel Features:")
+    logging.info(f"  Base channels: {model_config.get('base_channels', 96)}")
+    logging.info(f"  Fourier modes: {model_config.get('modes', 16)}")
+    logging.info(f"  Attention gates: {model_config.get('use_attention', True)}")
+    logging.info(f"  Multi-layer output head: Yes")
+    logging.info(f"  Softsign activation: Yes (peak preservation)")
+    logging.info("\nLoss Functions:")
     for key, value in physics_weights.items():
         logging.info(f"  {key}: {value}")
-    logging.info("="*60 + "\n")
+    logging.info("\nKey Features:")
+    logging.info("  - Multi-scale loss computation")
+    logging.info("  - Weighted MSE for high-velocity regions")
+    logging.info("  - Huber loss for peak preservation")
+    logging.info("  - L1 magnitude loss")
+    logging.info("  - Frequency domain consistency")
+    logging.info("  - Training noise for robustness")
+    logging.info("  - Attention-gated skip connections")
+    logging.info("  - Warm restart learning rate schedule")
+    logging.info("="*70 + "\n")
     
     # Start training
-    logging.info("Starting simplified U-Net-FNO training...")
+    logging.info("Starting U-Net-FNO training with peak preservation...")
     
     try:
         history = trainer.train(
@@ -228,9 +253,9 @@ def main():
         )
         
         # Training summary
-        logging.info("\n" + "="*60)
+        logging.info("\n" + "="*70)
         logging.info("TRAINING COMPLETED SUCCESSFULLY!")
-        logging.info("="*60)
+        logging.info("="*70)
         
         if history['val_loss']:
             final_val_loss = history['val_loss'][-1]
@@ -245,14 +270,16 @@ def main():
         logging.info(f"\nResults saved to: {run_dir}")
         logging.info(f"TensorBoard: tensorboard --logdir={logs_dir}")
         
-        # Key improvements made
-        logging.info("\nKey fixes applied:")
-        logging.info("  - Removed spectral loss (was causing 89x train/val gap)")
-        logging.info("  - Reduced model depth: 4→3")
-        logging.info("  - Reduced FNO modes: 16→12") 
-        logging.info("  - Better gradient clipping: 1.0→0.5")
-        logging.info("  - Lighter physics weights")
-        logging.info("  - Improved Sobel gradients for divergence")
+        # Features summary
+        logging.info("\nFeatures applied:")
+        logging.info("  - Increased model capacity: 96 channels, 16 modes")
+        logging.info("  - Attention gates for better feature selection")
+        logging.info("  - Multi-scale loss for better convergence")
+        logging.info("  - Peak preservation with Huber + L1 magnitude loss")
+        logging.info("  - High-velocity region emphasis")
+        logging.info("  - Frequency domain consistency")
+        logging.info("  - Training noise for robustness")
+        logging.info("  - Visualizations with peak analysis")
         
         return 0
         

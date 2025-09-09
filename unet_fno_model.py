@@ -40,6 +40,35 @@ class SpectralConv2d(nn.Module):
         return x
 
 
+class AttentionGate(nn.Module):
+    def __init__(self, F_g, F_l, F_int):
+        super().__init__()
+        self.W_g = nn.Sequential(
+            nn.Conv2d(F_g, F_int, kernel_size=1, stride=1, padding=0, bias=True),
+            nn.GroupNorm(min(4, F_int), F_int)
+        )
+        
+        self.W_x = nn.Sequential(
+            nn.Conv2d(F_l, F_int, kernel_size=1, stride=1, padding=0, bias=True),
+            nn.GroupNorm(min(4, F_int), F_int)
+        )
+
+        self.psi = nn.Sequential(
+            nn.Conv2d(F_int, 1, kernel_size=1, stride=1, padding=0, bias=True),
+            nn.GroupNorm(1, 1),
+            nn.Sigmoid()
+        )
+        
+        self.relu = nn.ReLU(inplace=True)
+        
+    def forward(self, g, x):
+        g1 = self.W_g(g)
+        x1 = self.W_x(x)
+        psi = self.relu(g1 + x1)
+        psi = self.psi(psi)
+        return x * psi
+
+
 class SimpleResBlock(nn.Module):
     def __init__(self, channels):
         super().__init__()
@@ -56,7 +85,7 @@ class SimpleResBlock(nn.Module):
 
 
 class DownBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, modes=8):
+    def __init__(self, in_channels, out_channels, modes=16):
         super().__init__()
         self.conv = nn.Conv2d(in_channels, out_channels, 3, padding=1)
         self.spectral = SpectralConv2d(out_channels, out_channels, modes, modes)
@@ -67,7 +96,6 @@ class DownBlock(nn.Module):
         
     def forward(self, x):
         x = F.gelu(self.norm(self.conv(x)))
-        # FNO block
         x1 = self.spectral(x)
         x2 = self.local(x)
         x = F.gelu(x1 + x2)
@@ -78,9 +106,14 @@ class DownBlock(nn.Module):
 
 
 class UpBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, skip_channels, modes=8):
+    def __init__(self, in_channels, out_channels, skip_channels, modes=16, use_attention=True):
         super().__init__()
+        self.use_attention = use_attention
         self.upsample = nn.ConvTranspose2d(in_channels, out_channels, 2, stride=2)
+        
+        if use_attention and skip_channels > 0:
+            self.attention = AttentionGate(out_channels, skip_channels, skip_channels // 2)
+        
         concat_channels = out_channels + skip_channels if skip_channels > 0 else out_channels
         self.conv = nn.Conv2d(concat_channels, out_channels, 3, padding=1)
         self.spectral = SpectralConv2d(out_channels, out_channels, modes, modes)
@@ -97,10 +130,13 @@ class UpBlock(nn.Module):
             skip_h, skip_w = skip.shape[-2:]
             if x_h != skip_h or x_w != skip_w:
                 x = F.interpolate(x, size=(skip_h, skip_w), mode='bilinear', align_corners=False)
+            
+            if self.use_attention:
+                skip = self.attention(x, skip)
+            
             x = torch.cat([x, skip], dim=1)
         
         x = F.gelu(self.norm(self.conv(x)))
-        # FNO block
         x1 = self.spectral(x)
         x2 = self.local(x)
         x = F.gelu(x1 + x2)
@@ -109,8 +145,8 @@ class UpBlock(nn.Module):
 
 
 class UNetFNO(nn.Module):
-    def __init__(self, in_channels=2, out_channels=2, base_channels=64, 
-                 depth=3, modes=12, enforce_incompressible=True):
+    def __init__(self, in_channels=2, out_channels=2, base_channels=96, 
+                 depth=3, modes=16, enforce_incompressible=True, use_attention=True):
         super().__init__()
         
         self.depth = depth
@@ -128,7 +164,7 @@ class UNetFNO(nn.Module):
         self.skip_channels = []
         channels = base_channels
         for i in range(depth):
-            out_ch = min(256, channels * 2) if i < depth - 1 else channels
+            out_ch = min(384, channels * 2) if i < depth - 1 else channels
             self.down_blocks.append(DownBlock(channels, out_ch, modes))
             self.skip_channels.append(out_ch)
             channels = out_ch
@@ -151,16 +187,22 @@ class UNetFNO(nn.Module):
                 out_ch = max(base_channels, current_channels // 2)
             
             skip_ch = skip_channels_for_decoder[i] if i < len(skip_channels_for_decoder) else 0
-            self.up_blocks.append(UpBlock(current_channels, out_ch, skip_ch, modes))
+            self.up_blocks.append(UpBlock(current_channels, out_ch, skip_ch, modes, use_attention))
             current_channels = out_ch
         
-        # Output head
+        # Output head with residual connection
         self.output_conv = nn.Sequential(
             nn.Conv2d(base_channels, base_channels // 2, 3, padding=1),
             nn.GroupNorm(min(4, base_channels // 2), base_channels // 2),
             nn.GELU(),
-            nn.Conv2d(base_channels // 2, out_channels, 1)
+            nn.Conv2d(base_channels // 2, base_channels // 4, 3, padding=1),
+            nn.GroupNorm(min(4, base_channels // 4), base_channels // 4),
+            nn.GELU(),
+            nn.Conv2d(base_channels // 4, out_channels, 1)
         )
+        
+        # Residual connection for output
+        self.output_residual = nn.Conv2d(base_channels, out_channels, 1)
         
         self.apply(self._init_weights)
     
@@ -190,27 +232,66 @@ class UNetFNO(nn.Module):
             skip = skip_connections[-(i+1)] if i < len(skip_connections) else None
             x = up_block(x, skip)
         
-        # Output
-        x = self.output_conv(x)
-        return torch.tanh(x)
+        # Output with residual connection
+        residual = self.output_residual(x)
+        output = self.output_conv(x)
+        output = output + residual
+        
+        # Use softsign for better peak preservation
+        return torch.softsign(output)
 
 
-def compute_physics_losses(pred_velocity, true_velocity, input_data):
-    """Simplified physics losses - removed problematic spectral loss"""
+def compute_multiscale_physics_losses(pred_velocity, true_velocity, input_data):
+    """Multi-scale physics losses with peak preservation"""
     losses = {}
+    device = pred_velocity.device
     
     # Extract components
     pred_u, pred_v = pred_velocity[:, 0:1], pred_velocity[:, 1:2]
+    true_u, true_v = true_velocity[:, 0:1], true_velocity[:, 1:2]
     
-    # MSE loss (main reconstruction loss)
-    losses['mse'] = F.mse_loss(pred_velocity, true_velocity)
+    # Multi-scale MSE loss
+    mse_loss = 0
+    scales = [1.0, 0.5, 0.25]
+    scale_weights = [1.0, 0.5, 0.25]
     
-    # Divergence loss (incompressibility) with proper gradient computation
-    # Use Sobel operators for more stable gradients
+    for scale, weight in zip(scales, scale_weights):
+        if scale < 1.0:
+            size = int(pred_velocity.shape[-1] * scale)
+            pred_scaled = F.interpolate(pred_velocity, size=(size, size), mode='bilinear', align_corners=False)
+            true_scaled = F.interpolate(true_velocity, size=(size, size), mode='bilinear', align_corners=False)
+        else:
+            pred_scaled = pred_velocity
+            true_scaled = true_velocity
+        
+        mse_loss += weight * F.mse_loss(pred_scaled, true_scaled)
+    
+    losses['mse'] = mse_loss / sum(scale_weights)
+    
+    # Weighted MSE emphasizing high-velocity regions
+    velocity_mag = torch.sqrt(true_u**2 + true_v**2 + 1e-6)
+    velocity_weights = 1 + 2 * (velocity_mag / (velocity_mag.max() + 1e-6))
+    losses['weighted_mse'] = torch.mean(velocity_weights * (pred_velocity - true_velocity)**2)
+    
+    # Huber loss for peak preservation
+    huber_delta = 0.1
+    diff = pred_velocity - true_velocity
+    abs_diff = torch.abs(diff)
+    huber_loss = torch.where(abs_diff <= huber_delta, 
+                            0.5 * diff**2, 
+                            huber_delta * (abs_diff - 0.5 * huber_delta))
+    losses['huber'] = torch.mean(huber_loss)
+    
+    # L1 loss on velocity magnitude for peak preservation
+    pred_mag = torch.sqrt(pred_u**2 + pred_v**2 + 1e-6)
+    true_mag = torch.sqrt(true_u**2 + true_v**2 + 1e-6)
+    losses['magnitude_l1'] = F.l1_loss(pred_mag, true_mag)
+    
+    # Divergence loss with Sobel gradients
     sobel_x = torch.tensor([[[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]]], 
-                          device=pred_u.device, dtype=pred_u.dtype) / 8.0
+                          device=device, dtype=pred_u.dtype) / 8.0
     sobel_y = torch.tensor([[[-1, -2, -1], [0, 0, 0], [1, 2, 1]]], 
-                          device=pred_u.device, dtype=pred_u.dtype) / 8.0
+                          device=device, dtype=pred_u.dtype) / 8.0
     
     du_dx = F.conv2d(pred_u, sobel_x.expand(pred_u.size(1), 1, -1, -1), 
                      padding=1, groups=pred_u.size(1))
@@ -220,11 +301,16 @@ def compute_physics_losses(pred_velocity, true_velocity, input_data):
     divergence = du_dx + dv_dy
     losses['divergence'] = torch.mean(divergence ** 2)
     
-    # Simplified boundary loss (just corners to avoid over-constraining)
+    # Boundary loss
     losses['boundary'] = (
         F.mse_loss(pred_velocity[:, :, 0, 0], pred_velocity[:, :, -1, -1]) +
         F.mse_loss(pred_velocity[:, :, 0, -1], pred_velocity[:, :, -1, 0])
     )
+    
+    # Frequency domain loss
+    pred_fft = torch.fft.rfft2(pred_velocity)
+    true_fft = torch.fft.rfft2(true_velocity)
+    losses['frequency'] = F.mse_loss(torch.abs(pred_fft), torch.abs(true_fft))
     
     return losses
 
